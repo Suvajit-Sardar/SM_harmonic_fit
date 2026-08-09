@@ -441,9 +441,20 @@ Write:
   `chi2`, `n_pix`, `n_eff`, `L0`, `L1`, `rms_residual`, `n_removed_quality_mask`
   (pixels dropped by the `sigma_artifact_floor_kms` cut, Section 5.3), plus the
   config and `"RAD = ring center"` in the table metadata.
-- `results/maps.npz` — `theta`, `R_arcsec`, `weights` (primary scheme),
-  `dv_prefit`, `dv_postfit`, `ring_mask_stack`.
-- `results/scans.npz` — the chi-squared cubes, grids, and `s1(PA)` curves.
+- `results/maps.npz` — per ring: `theta`, `R_arcsec`, `weights` (primary
+  scheme), `dv_prefit`, `dv_postfit`, `ring_mask_stack`. Also, once (not
+  per-ring, since they don't vary by ring): `data_mom1`, `data_mom2`,
+  `model_mom1`, `model_mom2`, `pixscale_arcsec` — `harmonic_plots.py` cannot
+  read FITS itself, so `fig_azimuthal_vlos` (raw, non-deprojected `V_los` vs.
+  the Barolo model) needs the maps carried through here instead. Likewise
+  `ring_results.ecsv` carries `vrot_kms`, `inc_deg`, `pa0_deg`, `vsys_kms`,
+  `xpos_pix`, `ypos_pix` per ring (repeated across its side/weighting rows,
+  like `r_in_arcsec`) so plots needing the fiducial geometry or the harmonic
+  model curve don't need the ringlog either.
+- `results/scans.npz` — the chi-squared cubes, grids, `s1(PA)` curves, and (per
+  ring, side, weighting) the raw bootstrap `s1` draws as `boot_s1_{side}_{scheme}`
+  -- `fig_bootstrap` needs the actual draws to histogram, not just the
+  16/50/84 percentiles already in `ring_results.ecsv`.
 
 Use `rms = sqrt(mean(residual**2))`, not `np.std`, which subtracts the residual
 mean and is not the RMS about zero.

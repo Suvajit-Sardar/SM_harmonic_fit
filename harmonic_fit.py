@@ -592,6 +592,7 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng):
 
     rows = []
     maps_extra = {"R_arcsec": R_arcsec, "theta": theta_full, "ring_mask_both": base_mask}
+    boot_extra = {}
 
     for side in SIDES:
         mask = side_masks[side]
@@ -620,12 +621,19 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng):
                 cfg.model_terms, cfg.n_bootstrap, rng,
             )
             lo, med, hi = np.percentile(boot_draws, [16, 50, 84])
+            boot_extra[f"boot_s1_{side}_{scheme}"] = boot_draws
 
             row = dict(
                 ring_index=ring_idx,
                 r_in_arcsec=r_in,
                 r_out_arcsec=r_out,
                 r_center_kpc=float(ringlog_row["r_center_kpc"]),
+                vrot_kms=vrot,
+                inc_deg=inc,
+                pa0_deg=pa0,
+                vsys_kms=vsys,
+                xpos_pix=xc,
+                ypos_pix=yc,
                 side=side,
                 weighting=scheme,
                 s1=fit_r.value("s1"),
@@ -671,7 +679,7 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng):
     pa_result["chi2_rescale_note"] = "rescaled so chi2_min/n_eff = 1: a calibration to n_eff, not a noise-model claim"
     vsys_result["chi2_rescale_note"] = pa_result["chi2_rescale_note"]
 
-    return rows, maps_extra, pa_result, vsys_result
+    return rows, maps_extra, pa_result, vsys_result, boot_extra
 
 
 def main(cfg: Config):
@@ -704,10 +712,18 @@ def main(cfg: Config):
     rng = np.random.default_rng(cfg.random_seed)
 
     all_rows = []
-    all_maps = {}
+    all_maps = {
+        "data_mom1": mapset.data_mom1,
+        "data_mom2": mapset.data_mom2,
+        "model_mom1": mapset.model_mom1,
+        "model_mom2": mapset.model_mom2,
+        "pixscale_arcsec": np.array(mapset.pixscale_arcsec),
+    }
     all_scans = {}
     for ring_idx, ringlog_row in enumerate(ringlog):
-        rows, maps_extra, pa_result, vsys_result = process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng)
+        rows, maps_extra, pa_result, vsys_result, boot_extra = process_ring(
+            cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng
+        )
         all_rows.extend(rows)
         for k, v in maps_extra.items():
             all_maps[f"ring{ring_idx}_{k}"] = v
@@ -717,6 +733,8 @@ def main(cfg: Config):
         for k, v in vsys_result.items():
             if k != "chi2_rescale_note":
                 all_scans[f"ring{ring_idx}_vsys_{k}"] = v
+        for k, v in boot_extra.items():
+            all_scans[f"ring{ring_idx}_{k}"] = v
 
     results_table = Table(rows=all_rows)
     results_table.meta["rad_convention"] = "RAD = ring center"
