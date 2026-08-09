@@ -1,425 +1,938 @@
-# Radial velocity fitting
+"""First-order harmonic decomposition of a MeerKAT HI velocity field.
+
+Measures ``s1 = V_rad(R)`` ring by ring from the data moment-1 map, holding
+the rotation curve fixed at the 3D-Barolo tilted-ring values. All science
+constants live in :class:`Config`; nothing is hardcoded elsewhere.
+
+Weighting-scheme note: ``sin2`` is the primary scheme used throughout this
+module, and its justification is *robustness, not optimality*. It is formally
+less precise than uniform weighting under homoscedastic noise, but it
+downweights the major axis -- where residuals are dominated by errors in the
+fixed VROT, by beam smearing across the steep velocity gradient, and by any
+warp -- more than it costs in raw precision. Do not describe it as optimal.
+
+This module performs no plotting (no matplotlib import) and writes all
+results to ``results/``. See ``harmonic_plots.py`` for figures.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
 
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import matplotlib.patches as patches
-from matplotlib.ticker import AutoMinorLocator
 from astropy.io import fits
-from scipy.optimize import curve_fit
-import warnings
+from astropy.table import Table
 
-warnings.filterwarnings("ignore", category=RuntimeWarning)
+# --------------------------------------------------------------------------
+# 5.1 Config
+# --------------------------------------------------------------------------
 
-# STYLE SETTINGS (Matched to Rotation Curve Script)
-custom_rcparams = {
-    "font.family": "serif",
-    "font.serif": ["Times New Roman", "Times", "Nimbus Roman"],
-    "font.size": 30,
-    "axes.labelsize": 30,
-    "axes.titlesize": 30,
-    "legend.fontsize": 25,
-    "xtick.labelsize": 25,
-    "ytick.labelsize": 25,
-    "xtick.major.pad": 10,
-    "ytick.major.pad": 2,
-    "axes.linewidth": 1.0,
-    "lines.linewidth": 1.5,
-    "lines.markersize": 8,
-    "xtick.direction": "in",
-    "ytick.direction": "in",
-    "xtick.top": True,
-    "xtick.bottom": True,
-    "ytick.left": True,
-    "ytick.right": True,
-    "xtick.major.size": 8,
-    "ytick.major.size": 8,
-    "xtick.minor.size": 3,
-    "ytick.minor.size": 3,
-    "figure.figsize": (10, 8),
-    "figure.dpi": 100,
-    "savefig.dpi": 300,
-    "legend.frameon": True,
-    "legend.facecolor": "white",
-    "legend.edgecolor": "black",
-    "legend.loc": "best",
-    "axes.edgecolor": "black",
-    "xtick.labelcolor": "black",
-    "ytick.labelcolor": "black",
-    "text.usetex": False,
+
+@dataclass
+class Config:
+    project_dir: Path
+    maps_dir: Path
+    ringlog_path: Path
+    results_dir: Path
+
+    weighting_schemes: tuple = ("uniform", "sin2", "invvar")
+    primary_weighting: str = "sin2"
+    model_terms: tuple = ("c0", "s1")  # c1 (VROT) is always fixed, never a column
+    sigma_floor_kms: float = 5.0  # weight clipping only -- never applied to chi2/covariance sigma
+    sigma_artifact_floor_kms: float = 0.5  # data-quality mask: exclude near-zero data mom2
+    # (SoFiA linewidth collapse at marginal S/N, empirically < 4e-4 km/s, vs. real dispersion
+    # >= 2.75 km/s -- a 4-order-of-magnitude gap. Distinct from sigma_floor_kms and from the
+    # prohibited old ">= 5.0" cut; see CLAUDE.md 5.3.)
+
+    pa_scan_halfwidth_deg: float = 15.0
+    pa_scan_step_deg: float = 0.25
+    vsys_scan_halfwidth_kms: float = 20.0
+    vsys_scan_step_kms: float = 0.5
+    s1_grid_halfwidth_kms: float = 80.0
+    s1_grid_step_kms: float = 0.5
+
+    n_bootstrap: int = 2000
+    random_seed: int = 42
+
+    def __post_init__(self):
+        self.project_dir = Path(self.project_dir)
+        self.maps_dir = Path(self.maps_dir)
+        self.ringlog_path = Path(self.ringlog_path)
+        self.results_dir = Path(self.results_dir)
+        if "s1" not in self.model_terms:
+            raise ValueError("model_terms must include 's1' -- that is the quantity of interest.")
+
+
+SIDES = ("both", "approaching", "receding")
+
+_MODEL_TERM_FUNCS = {
+    "c0": lambda theta: np.ones_like(theta),
+    "s1": lambda theta: np.sin(theta),
+    "c2": lambda theta: np.cos(2.0 * theta),
+    "s2": lambda theta: np.sin(2.0 * theta),
 }
-mpl.rcParams.update(custom_rcparams)
 
 
-## INPUT PARAMS
-fits_file_mom1 = '20_tar_mom1.fits'
-fits_file_mom2 = '20_tar_mom2.fits'
-
-x_c, y_c = 24.53919445613506, 26.309980891051914  
-segments = 24            
-inc_deg = 49              
-V_sys = 4676.0              
-pix_scale = 4.0             
-
-PA_deg = 53 + 90            
-KPC_PER_ARCSEC = 0.329
-
-# Height control for A/R text labels 
-text_label_height = 0.55
-
-# Rings in arcsec
-rings_arcsec = [
-    (38.15, 47.85),
-    (47.85, 57.55),
-    (57.55, 67.25),
-    (67.25, 76.95)
-]
-rings_pix = [(r_in / pix_scale, r_out / pix_scale) for r_in, r_out in rings_arcsec]
-
-# TRM vrot
-vrot_bbarolo = [260.175, 295.133, 301.112, 301.181]
-
-# PLOT CONTROLS
-inset_pos = [0.614, 0.13, 0.30, 0.30] 
-inset_zoom_pix = 25  
+def design_matrix(theta: np.ndarray, terms: Sequence[str]) -> np.ndarray:
+    return np.column_stack([_MODEL_TERM_FUNCS[t](theta) for t in terms])
 
 
-### READ FITS & CONVERT UNITS
-hdul1 = fits.open(fits_file_mom1)
-data_mom1 = np.squeeze(hdul1[0].data)
-data_mom1 = data_mom1 / 1000.0  
-
-hdul2 = fits.open(fits_file_mom2)
-data_mom2 = np.squeeze(hdul2[0].data)
-data_mom2 = data_mom2 / 1000.0  
+# --------------------------------------------------------------------------
+# 5.2 I/O
+# --------------------------------------------------------------------------
 
 
-#### GENERATE DEPROJECTED COORDINATES & AZIMUTH
-y_indices, x_indices = np.indices(data_mom1.shape)
+def read_ringlog(path: Path) -> Table:
+    """Whitespace-delimited, '#'-comment header. Ring edges are attached as
+    RAD +/- width/2 -- RAD is the ring center (confirmed by the project owner,
+    reproduces the ring bounds of the previous script exactly)."""
+    t = Table.read(str(path), format="ascii.commented_header")
 
-dx = x_indices - x_c
-dy = y_indices - y_c
+    rad_arcs = np.asarray(t["RAD(arcs)"], dtype=float)
+    rad_kpc = np.asarray(t["RAD(Kpc)"], dtype=float)
 
-PA_rad = np.radians(PA_deg)
-inc_rad = np.radians(inc_deg)
+    diffs = np.diff(rad_arcs)
+    if not np.allclose(diffs, diffs[0], rtol=1e-6):
+        raise RuntimeError(f"Ring radii are not uniformly spaced: diffs = {diffs}")
+    width = diffs[0]
 
-dx_rot = dx * np.cos(PA_rad) + dy * np.sin(PA_rad)
-dy_rot = -dx * np.sin(PA_rad) + dy * np.cos(PA_rad)
+    kpc_per_arcsec = rad_kpc / rad_arcs
+    if not np.allclose(kpc_per_arcsec, kpc_per_arcsec[0], rtol=1e-3):
+        raise RuntimeError(f"kpc_per_arcsec is inconsistent across rows: {kpc_per_arcsec}")
 
-dy_deproj = dy_rot / np.cos(inc_rad)
-R_pix = np.sqrt(dx_rot**2 + dy_deproj**2)
-
-theta_rad = np.arctan2(dy_deproj, dx_rot)
-theta_deg = np.degrees(theta_rad) % 360.0
-
-
-##### PREPARE DATA FOR HARMONIC FITTING
-v_plane_map = (data_mom1 - V_sys) / np.sin(inc_rad)
-v_err_map = data_mom2  
-
-def harmonic_model(theta, v_rot, v_rad):
-    return v_rot * np.cos(theta) + v_rad * np.sin(theta)
+    t["r_in_arcsec"] = rad_arcs - width / 2.0
+    t["r_out_arcsec"] = rad_arcs + width / 2.0
+    t["r_center_kpc"] = rad_kpc
+    t["kpc_per_arcsec"] = kpc_per_arcsec
+    t.meta["ring_width_arcsec"] = float(width)
+    t.meta["kpc_per_arcsec"] = float(np.mean(kpc_per_arcsec))
+    t.meta["rad_convention"] = "RAD = ring center"
+    return t
 
 
-###### CALCULATE WEIGHTED FITS & BINNED PROFILES
-theta_edges = np.linspace(0, 360, segments + 1)
-theta_centers = (theta_edges[:-1] + theta_edges[1:]) / 2.0
-
-binned_profiles = []
-fit_curves = []
-
-# Arrays for vrad plot
-v_rad_fits_array = []
-rms_array = []
-ring_centers_arcsec = [np.mean(r) for r in rings_arcsec]
-
-# New arrays for A and R fits
-v_rad_app_array = []
-rms_app_array = []
-v_rad_rec_array = []
-rms_rec_array = []
-
-# --- Determine Masks for Approaching and Receding Sides ---
-sky_phi = np.degrees(np.arctan2(dy, dx)) % 360.0
-# Receding:
-mask_rec_sky = (sky_phi >= 134) & (sky_phi < 314)
-# Approaching:
-mask_app_sky = (sky_phi >= 314) | (sky_phi < 134)
-
-total_chi2 = 0.0
-total_dof = 0
-
-print("\n" + "-"*100)
-print(f"{'Ring (arcsec)':<15} | {'Fixed_Vrot':<10} | {'Fit_Vrad':<10} | {'RMS (km/s)':<10} | {'DoF':<8} | {'Chi2':<10} | {'Red_Chi2':<8}")
-print("-" * 100)
-
-for i, (r_in_pix, r_out_pix) in enumerate(rings_pix):
-    mask_ring = (R_pix >= r_in_pix) & (R_pix < r_out_pix) & np.isfinite(v_plane_map) & np.isfinite(v_err_map) & (v_err_map >= 5.0)
-    
-    # ---------------- OVERALL FIT ----------------
-    val_theta_rad = theta_rad[mask_ring]
-    val_v_plane = v_plane_map[mask_ring]
-    val_v_err = v_err_map[mask_ring]
-    
-    fixed_vrot = vrot_bbarolo[i]
-    p0 = [0.0] 
-    
-    popt, pcov = curve_fit(
-        lambda t, v_rad: harmonic_model(t, fixed_vrot, v_rad), 
-        val_theta_rad, val_v_plane, p0=p0, sigma=val_v_err, absolute_sigma=True     
+def _bunit_to_kms(data: np.ndarray, bunit: str, fname: str) -> np.ndarray:
+    b = (bunit or "").replace(" ", "").upper()
+    if b in ("KM/S", "KMS-1", "KM.S-1", "KM.S**-1"):
+        return data
+    if b in ("M/S", "MS-1", "M.S-1", "M.S**-1"):
+        return data / 1000.0
+    raise RuntimeError(
+        f"{fname}: unrecognized BUNIT {bunit!r}; expected KM/S or M/S. "
+        "Refusing to guess -- the old script silently divided by 1000 and "
+        "would corrupt data already in km/s."
     )
-    v_rad_fit = popt[0]
-    residuals = val_v_plane - harmonic_model(val_theta_rad, fixed_vrot, v_rad_fit)
-    rms = np.std(residuals)
-    
-    v_rad_fits_array.append(v_rad_fit)
-    rms_array.append(rms)
-    
-    # ---------------- APPROACHING FIT ----------------
-    mask_app = mask_ring & mask_app_sky
-    val_theta_app = theta_rad[mask_app]
-    val_v_plane_app = v_plane_map[mask_app]
-    val_v_err_app = v_err_map[mask_app]
-    
-    if len(val_theta_app) > 5:
-        popt_app, _ = curve_fit(
-            lambda t, v_rad: harmonic_model(t, fixed_vrot, v_rad), 
-            val_theta_app, val_v_plane_app, p0=[0.0], sigma=val_v_err_app, absolute_sigma=True
+
+
+@dataclass
+class MapSet:
+    shape: tuple
+    data_mom1: np.ndarray
+    data_mom2: np.ndarray
+    model_mom1: np.ndarray
+    model_mom2: np.ndarray
+    cdelt1_deg: float
+    cdelt2_deg: float
+    pixscale_arcsec: float
+    bmaj_deg: float
+    bmin_deg: float
+    bpa_deg: float
+
+
+def _read_beam(header, fname: str):
+    bmaj, bmin, bpa = header.get("BMAJ"), header.get("BMIN"), header.get("BPA")
+    if bmaj is not None and bmin is not None and bpa is not None:
+        return float(bmaj), float(bmin), float(bpa)
+    for card in header.get("HISTORY", []):
+        s = str(card)
+        if "BMAJ" in s.upper():
+            raise RuntimeError(
+                f"{fname}: BMAJ/BMIN/BPA missing from header keywords but found in "
+                f"a HISTORY card ('{s}'); parsing AIPS-style HISTORY beam cards is "
+                "not implemented -- add it if this ever fires."
+            )
+    raise RuntimeError(
+        f"{fname}: no BMAJ/BMIN/BPA in header and no HISTORY beam card found. "
+        "The bootstrap needs the beam size to define independent cells; cannot proceed."
+    )
+
+
+def load_maps(maps_dir: Path) -> MapSet:
+    maps_dir = Path(maps_dir)
+    all_1mom = sorted(maps_dir.glob("*_1mom.fits"))
+    all_2mom = sorted(maps_dir.glob("*_2mom.fits"))
+
+    data_1mom = [f for f in all_1mom if "_local_" not in f.name]
+    model_1mom = [f for f in all_1mom if "_local_" in f.name]
+    data_2mom = [f for f in all_2mom if "_local_" not in f.name]
+    model_2mom = [f for f in all_2mom if "_local_" in f.name]
+
+    for label, files in (
+        ("data _1mom", data_1mom),
+        ("model _local_1mom", model_1mom),
+        ("data _2mom", data_2mom),
+        ("model _local_2mom", model_2mom),
+    ):
+        if len(files) != 1:
+            raise RuntimeError(
+                f"Expected exactly one {label}.fits file in {maps_dir}, found {len(files)}: {files}"
+            )
+
+    data_1mom, model_1mom, data_2mom, model_2mom = (
+        data_1mom[0],
+        model_1mom[0],
+        data_2mom[0],
+        model_2mom[0],
+    )
+
+    hdu1 = fits.open(data_1mom)[0]
+    header = hdu1.header
+    data_mom1 = _bunit_to_kms(np.squeeze(hdu1.data).astype(float), header.get("BUNIT"), data_1mom.name)
+    data_mom2 = _bunit_to_kms(
+        np.squeeze(fits.getdata(data_2mom)).astype(float),
+        fits.getheader(data_2mom).get("BUNIT"),
+        data_2mom.name,
+    )
+    model_mom1 = _bunit_to_kms(
+        np.squeeze(fits.getdata(model_1mom)).astype(float),
+        fits.getheader(model_1mom).get("BUNIT"),
+        model_1mom.name,
+    )
+    model_mom2 = _bunit_to_kms(
+        np.squeeze(fits.getdata(model_2mom)).astype(float),
+        fits.getheader(model_2mom).get("BUNIT"),
+        model_2mom.name,
+    )
+
+    if not (data_mom1.shape == data_mom2.shape == model_mom1.shape == model_mom2.shape):
+        raise RuntimeError(
+            f"Map shape mismatch: data_mom1={data_mom1.shape}, data_mom2={data_mom2.shape}, "
+            f"model_mom1={model_mom1.shape}, model_mom2={model_mom2.shape}"
         )
-        v_rad_fit_app = popt_app[0]
-        rms_app = np.std(val_v_plane_app - harmonic_model(val_theta_app, fixed_vrot, v_rad_fit_app))
-    else:
-        v_rad_fit_app, rms_app = np.nan, np.nan
-        
-    v_rad_app_array.append(v_rad_fit_app)
-    rms_app_array.append(rms_app)
-    
-    # ---------------- RECEDING FIT ----------------
-    mask_rec = mask_ring & mask_rec_sky
-    val_theta_rec = theta_rad[mask_rec]
-    val_v_plane_rec = v_plane_map[mask_rec]
-    val_v_err_rec = v_err_map[mask_rec]
-    
-    if len(val_theta_rec) > 5:
-        popt_rec, _ = curve_fit(
-            lambda t, v_rad: harmonic_model(t, fixed_vrot, v_rad), 
-            val_theta_rec, val_v_plane_rec, p0=[0.0], sigma=val_v_err_rec, absolute_sigma=True
+
+    cdelt1 = float(header["CDELT1"])
+    cdelt2 = float(header["CDELT2"])
+    if not np.isclose(abs(cdelt1), abs(cdelt2), rtol=1e-6):
+        raise RuntimeError(f"|CDELT1| != |CDELT2| ({cdelt1} vs {cdelt2}); non-square pixels not supported.")
+    pixscale_arcsec = abs(cdelt1) * 3600.0
+
+    bmaj, bmin, bpa = _read_beam(header, data_1mom.name)
+
+    return MapSet(
+        shape=data_mom1.shape,
+        data_mom1=data_mom1,
+        data_mom2=data_mom2,
+        model_mom1=model_mom1,
+        model_mom2=model_mom2,
+        cdelt1_deg=cdelt1,
+        cdelt2_deg=cdelt2,
+        pixscale_arcsec=pixscale_arcsec,
+        bmaj_deg=bmaj,
+        bmin_deg=bmin,
+        bpa_deg=bpa,
+    )
+
+
+# --------------------------------------------------------------------------
+# 5.3 Geometry
+# --------------------------------------------------------------------------
+
+
+def make_geometry(shape, xc, yc, pa_barolo_deg, inc_deg, cdelt1_sign):
+    """Pure function, no globals, no I/O. Returns (R_pix, theta_rad).
+
+    theta = 0 on the receding major axis, theta = 180 deg on the approaching
+    side, theta = +/-90 deg on the minor axis (max V_rad leverage).
+    """
+    if cdelt1_sign < 0:
+        pa_math_deg = pa_barolo_deg + 90.0
+    elif cdelt1_sign > 0:
+        raise NotImplementedError(
+            "CDELT1 > 0 (east-right display orientation) is not a confirmed "
+            "convention for this project -- only east-left (CDELT1 < 0) has "
+            "been validated against the Barolo PA convention. Refusing to "
+            "silently support both handedness conventions; see CLAUDE.md 2.1."
         )
-        v_rad_fit_rec = popt_rec[0]
-        rms_rec = np.std(val_v_plane_rec - harmonic_model(val_theta_rec, fixed_vrot, v_rad_fit_rec))
     else:
-        v_rad_fit_rec, rms_rec = np.nan, np.nan
-        
-    v_rad_rec_array.append(v_rad_fit_rec)
-    rms_rec_array.append(rms_rec)
-    
-    # Statistics
-    dof = len(val_v_plane) - 1  
-    chi2 = np.sum((residuals / val_v_err)**2)
-    red_chi2 = chi2 / dof if dof > 0 else np.nan
-    
-    total_chi2 += chi2
-    total_dof += dof
-    
-    print(f"{rings_arcsec[i][0]:5.2f}'' - {rings_arcsec[i][1]:5.2f}'' | {fixed_vrot:10.1f} | {v_rad_fit:10.1f} | {rms:10.1f} | {dof:8d} | {chi2:10.1f} | {red_chi2:8.2f}")
-    
-    theta_smooth = np.radians(np.linspace(0, 360, 200))
-    fit_curves.append(harmonic_model(theta_smooth, fixed_vrot, v_rad_fit))
-    
-    v_ring_binned = np.zeros(segments)
-    for j in range(segments):
-        t_min = theta_edges[j]
-        t_max = theta_edges[j+1]
-        mask_wedge = mask_ring & (theta_deg >= t_min) & (theta_deg < t_max)
-        if np.sum(mask_wedge) > 0:
-            v_ring_binned[j] = np.nanmean(v_plane_map[mask_wedge])
+        raise RuntimeError("CDELT1 == 0; cannot determine image orientation.")
+
+    pa_rad = np.radians(pa_math_deg)
+    inc_rad = np.radians(inc_deg)
+
+    y_idx, x_idx = np.indices(shape)
+    dx = x_idx - xc
+    dy = y_idx - yc
+
+    dx_rot = dx * np.cos(pa_rad) + dy * np.sin(pa_rad)
+    dy_rot = -dx * np.sin(pa_rad) + dy * np.cos(pa_rad)
+    dy_deproj = dy_rot / np.cos(inc_rad)
+
+    R_pix = np.hypot(dx_rot, dy_deproj)
+    theta_rad = np.arctan2(dy_deproj, dx_rot)
+    return R_pix, theta_rad
+
+
+def ring_mask(R_arcsec, r_in, r_out, mom1, mom2):
+    return (R_arcsec >= r_in) & (R_arcsec < r_out) & np.isfinite(mom1) & np.isfinite(mom2)
+
+
+def data_quality_mask(data_mom2, sigma_artifact_floor_kms):
+    """Excludes pixels where data mom2 has collapsed to near-zero (SoFiA
+    linewidth artifact at marginal S/N), distinct from the prohibited
+    mom2 >= 5.0 cut -- see CLAUDE.md 5.3. Never applied to the model."""
+    return data_mom2 >= sigma_artifact_floor_kms
+
+
+def assert_receding_side(theta_rad, model_mom1, vsys, outer_mask):
+    """Section 2.3: within the outermost ring, the (unweighted) mean of
+    (model_mom1 - VSYS) over cos(theta) > 0 pixels must be positive, and
+    negative over cos(theta) < 0. Uses the Barolo MODEL mom1 so the test is
+    not confused by real non-circular motion. This single check permanently
+    closes the +90 / east-left question."""
+    cos_t = np.cos(theta_rad)
+    rec = outer_mask & (cos_t > 0)
+    app = outer_mask & (cos_t < 0)
+    if not np.any(rec) or not np.any(app):
+        raise RuntimeError("Receding-side assertion: outer ring has no pixels on one side; cannot test.")
+    mean_rec = float(np.nanmean(model_mom1[rec] - vsys))
+    mean_app = float(np.nanmean(model_mom1[app] - vsys))
+    if not (mean_rec > 0 and mean_app < 0):
+        raise RuntimeError(
+            "Receding-side assertion FAILED: expected mean(model_mom1-VSYS) > 0 "
+            f"for cos(theta)>0 and < 0 for cos(theta)<0. Got mean_receding={mean_rec:.3f}, "
+            f"mean_approaching={mean_app:.3f}. The PA/handedness convention (CLAUDE.md 2.1) "
+            "is very likely wrong."
+        )
+    return mean_rec, mean_app
+
+
+# --------------------------------------------------------------------------
+# 5.4 Weighting
+# --------------------------------------------------------------------------
+
+
+def compute_weights(theta_rad, sigma_kms, scheme, sigma_floor_kms):
+    if scheme == "uniform":
+        w = np.ones_like(theta_rad)
+    elif scheme == "sin2":
+        w = np.sin(theta_rad) ** 2
+    elif scheme == "invvar":
+        sigma_w = np.maximum(sigma_kms, sigma_floor_kms)
+        w = 1.0 / sigma_w**2
+    else:
+        raise ValueError(f"Unknown weighting scheme: {scheme!r}")
+
+    total = np.sum(w)
+    if total <= 0:
+        raise RuntimeError(f"Weighting scheme {scheme!r} produced sum(w) <= 0; cannot normalise.")
+    w = w * (len(w) / total)
+    return w
+
+
+# --------------------------------------------------------------------------
+# 5.5 The fit
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class FitResult:
+    terms: tuple
+    p: np.ndarray
+    cov: np.ndarray
+    corr: np.ndarray
+    resid: np.ndarray
+
+    def value(self, term):
+        return float(self.p[self.terms.index(term)])
+
+    def err(self, term):
+        i = self.terms.index(term)
+        return float(np.sqrt(self.cov[i, i]))
+
+
+def build_data_vector(mom1, vsys, inc_deg, vrot, theta_rad):
+    """d = (V_los - VSYS)/sin(inc) - VROT*cos(theta); c1 (VROT) removed as a
+    subtraction, never a design-matrix column."""
+    return (mom1 - vsys) / np.sin(np.radians(inc_deg)) - vrot * np.cos(theta_rad)
+
+
+def fit_wls(d, theta_rad, w, sigma_kms, terms):
+    """Weighted linear least squares. Do not use curve_fit -- the model is
+    linear in every free parameter and this is the analytic solution.
+
+    Covariance uses the sandwich form because w != 1/sigma**2 in general
+    (uniform, sin2): Cov = inv(M) (A' W diag(sigma^2) W A) inv(M). These are
+    formal errors, reference only -- they assume independent pixels, which is
+    false at 4-arcsec pixels under a MeerKAT beam. The bootstrap is the
+    quoted statistical error.
+    """
+    A = design_matrix(theta_rad, terms)
+    M = A.T @ (w[:, None] * A)
+    rhs = A.T @ (w * d)
+    p = np.linalg.solve(M, rhs)
+    resid = d - A @ p
+
+    Minv = np.linalg.inv(M)
+    sandwich = A.T @ ((w * sigma_kms**2 * w)[:, None] * A)
+    cov = Minv @ sandwich @ Minv
+    sd = np.sqrt(np.clip(np.diag(cov), 0, None))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = cov / np.outer(sd, sd)
+
+    return FitResult(terms=tuple(terms), p=p, cov=cov, corr=corr, resid=resid)
+
+
+def leakage_diagnostics(theta_rad, w):
+    """Bias in s1_hat = sum(w d sin)/sum(w sin^2) from a constant offset eps
+    (L0) and a VROT error dVROT (L1). Both vanish analytically for symmetric
+    azimuthal coverage; blanked pixels break that symmetry."""
+    sin_t = np.sin(theta_rad)
+    cos_t = np.cos(theta_rad)
+    denom = np.sum(w * sin_t**2)
+    L0 = np.sum(w * sin_t) / denom
+    L1 = np.sum(w * sin_t * cos_t) / denom
+    return float(L0), float(L1)
+
+
+def rms_about_zero(resid):
+    return float(np.sqrt(np.mean(resid**2)))
+
+
+def pa_degeneracy_slope(theta_rad, w, vrot, inc_deg):
+    """Inclination-corrected PA->s1 leakage slope (km/s per radian of PA
+    error), for the analytic overlay in fig_pa_degeneracy and for the PA
+    self-test. The flat-sky slope -VROT is only exact at inc=0: deprojecting
+    through cos(inc) makes dtheta/d(dPA) range from -1/cos(inc) on the major
+    axis to -cos(inc) on the minor axis (see CLAUDE.md 5.6), so the estimator
+    picks up a weighted average K of that, not -1. Computed numerically from
+    the actual pixel theta/weight arrays so it is correct for invvar
+    weighting with spatially-varying sigma too, not just the closed forms
+    that hold for constant-sigma schemes."""
+    cos_i = np.cos(np.radians(inc_deg))
+    g = -(np.cos(theta_rad) ** 2 / cos_i + cos_i * np.sin(theta_rad) ** 2)
+    sin2_t = np.sin(theta_rad) ** 2
+    K = np.sum(w * g * sin2_t) / np.sum(w * sin2_t)
+    return vrot * K  # multiply by dPA in radians to get s1_leak
+
+
+# --------------------------------------------------------------------------
+# 5.7 Bootstrap
+# --------------------------------------------------------------------------
+
+
+def pixels_per_beam(bmaj_deg, bmin_deg, cdelt1_deg, cdelt2_deg):
+    return 1.1331 * bmaj_deg * bmin_deg / abs(cdelt1_deg * cdelt2_deg)
+
+
+def beam_cell_ids(y_idx, x_idx, cell_side_pix, n_cols):
+    n_cells_x = int(np.ceil(n_cols / cell_side_pix)) + 1
+    return (y_idx // cell_side_pix).astype(np.int64) * n_cells_x + (x_idx // cell_side_pix).astype(np.int64)
+
+
+def block_bootstrap_s1(
+    d, theta_rad, sigma_kms, cell_id, scheme, sigma_floor_kms, terms, n_bootstrap, rng
+):
+    """Resample beam-sized cells with replacement, concatenate their pixels,
+    refit. Returns array of bootstrap s1 draws, plus n_cells."""
+    unique_cells, inverse = np.unique(cell_id, return_inverse=True)
+    cell_pixels = [np.nonzero(inverse == i)[0] for i in range(len(unique_cells))]
+    n_cells = len(unique_cells)
+    s1_idx = terms.index("s1")
+
+    draws = np.empty(n_bootstrap)
+    for b in range(n_bootstrap):
+        sampled = rng.integers(0, n_cells, size=n_cells)
+        idx = np.concatenate([cell_pixels[c] for c in sampled])
+        d_b, th_b, sig_b = d[idx], theta_rad[idx], sigma_kms[idx]
+        w_b = compute_weights(th_b, sig_b, scheme, sigma_floor_kms)
+        fit_b = fit_wls(d_b, th_b, w_b, sig_b, terms)
+        draws[b] = fit_b.p[s1_idx]
+    return draws, n_cells
+
+
+# --------------------------------------------------------------------------
+# 5.8 Scans
+# --------------------------------------------------------------------------
+
+
+def _profile_chi2_grid_over_s1(d, theta_rad, w, sigma_kms, nuisance_terms, s1_grid):
+    """Fix s1 on a grid, profile out the remaining (nuisance) free terms by
+    weighted least squares, and evaluate chi2 = sum((resid/sigma)^2) with
+    sigma from mom2 -- independent of the fitting weights -- at each point.
+    Fast path for a single nuisance term (the default: just c0)."""
+    sin_t = np.sin(theta_rad)
+    n_grid = len(s1_grid)
+
+    if len(nuisance_terms) == 1 and nuisance_terms[0] == "c0":
+        # closed form: c0_hat(s1) = sum(w*(d - s1*sin)) / sum(w)
+        r = d[None, :] - s1_grid[:, None] * sin_t[None, :]
+        sum_w = np.sum(w)
+        c0_hat = np.sum(w[None, :] * r, axis=1) / sum_w
+        resid = r - c0_hat[:, None]
+        chi2 = np.sum((resid / sigma_kms[None, :]) ** 2, axis=1)
+        return chi2, c0_hat[:, None]
+
+    A_nuis = design_matrix(theta_rad, nuisance_terms)
+    k = A_nuis.shape[1]
+    chi2 = np.empty(n_grid)
+    p_nuis = np.empty((n_grid, k))
+    WA = w[:, None] * A_nuis
+    M = A_nuis.T @ WA
+    for i, s1 in enumerate(s1_grid):
+        r = d - s1 * sin_t
+        rhs = A_nuis.T @ (w * r)
+        p = np.linalg.solve(M, rhs)
+        resid = r - A_nuis @ p
+        chi2[i] = np.sum((resid / sigma_kms) ** 2)
+        p_nuis[i] = p
+    return chi2, p_nuis
+
+
+def pa_scan(cfg, ringlog_row, mapset, fiducial_mask, xc, yc, inc_deg, vrot, vsys, cdelt1_sign):
+    """Freeze the pixel set at the fiducial ring mask; only theta is rebuilt
+    at each scanned PA. See CLAUDE.md 5.8 for why the mask must not change."""
+    pa0 = float(ringlog_row["P.A.(deg)"])
+    pa_grid = np.arange(-cfg.pa_scan_halfwidth_deg, cfg.pa_scan_halfwidth_deg + 1e-9, cfg.pa_scan_step_deg) + pa0
+    s1_grid = np.arange(-cfg.s1_grid_halfwidth_kms, cfg.s1_grid_halfwidth_kms + 1e-9, cfg.s1_grid_step_kms)
+
+    y_idx, x_idx = np.indices(mapset.shape)
+    y_m, x_m = y_idx[fiducial_mask], x_idx[fiducial_mask]
+    mom1_m = mapset.data_mom1[fiducial_mask]
+    mom2_m = mapset.data_mom2[fiducial_mask]
+
+    s1_best = np.empty(len(pa_grid))
+    chi2_best = np.empty(len(pa_grid))
+    chi2_grid = np.empty((len(pa_grid), len(s1_grid)))
+    nuisance_terms = tuple(t for t in cfg.model_terms if t != "s1")
+
+    for i, pa in enumerate(pa_grid):
+        _, theta_full = make_geometry(mapset.shape, xc, yc, pa, inc_deg, cdelt1_sign)
+        theta_m = theta_full[fiducial_mask]
+        d_m = build_data_vector(mom1_m, vsys, inc_deg, vrot, theta_m)
+        w_m = compute_weights(theta_m, mom2_m, cfg.primary_weighting, cfg.sigma_floor_kms)
+
+        fit_i = fit_wls(d_m, theta_m, w_m, mom2_m, cfg.model_terms)
+        s1_best[i] = fit_i.value("s1")
+        chi2_best[i] = np.sum((fit_i.resid / mom2_m) ** 2)
+
+        chi2_grid[i], _ = _profile_chi2_grid_over_s1(d_m, theta_m, w_m, mom2_m, nuisance_terms, s1_grid)
+
+    return {"pa_grid_deg": pa_grid, "s1_grid_kms": s1_grid, "s1_best": s1_best,
+            "chi2_best": chi2_best, "chi2_grid": chi2_grid, "pa0_deg": pa0}
+
+
+def vsys_scan(cfg, ringlog_row, mapset, fiducial_mask, xc, yc, pa0, inc_deg, vrot, vsys0, cdelt1_sign):
+    """Geometry is unaffected by VSYS -- only the data vector shifts -- so
+    theta and weights are computed once and reused for every grid point."""
+    vsys_grid = np.arange(-cfg.vsys_scan_halfwidth_kms, cfg.vsys_scan_halfwidth_kms + 1e-9, cfg.vsys_scan_step_kms) + vsys0
+    s1_grid = np.arange(-cfg.s1_grid_halfwidth_kms, cfg.s1_grid_halfwidth_kms + 1e-9, cfg.s1_grid_step_kms)
+
+    _, theta_full = make_geometry(mapset.shape, xc, yc, pa0, inc_deg, cdelt1_sign)
+    theta_m = theta_full[fiducial_mask]
+    mom1_m = mapset.data_mom1[fiducial_mask]
+    mom2_m = mapset.data_mom2[fiducial_mask]
+    w_m = compute_weights(theta_m, mom2_m, cfg.primary_weighting, cfg.sigma_floor_kms)
+    nuisance_terms = tuple(t for t in cfg.model_terms if t != "s1")
+
+    s1_best = np.empty(len(vsys_grid))
+    chi2_best = np.empty(len(vsys_grid))
+    chi2_grid = np.empty((len(vsys_grid), len(s1_grid)))
+
+    for i, vsys in enumerate(vsys_grid):
+        d_m = build_data_vector(mom1_m, vsys, inc_deg, vrot, theta_m)
+        fit_i = fit_wls(d_m, theta_m, w_m, mom2_m, cfg.model_terms)
+        s1_best[i] = fit_i.value("s1")
+        chi2_best[i] = np.sum((fit_i.resid / mom2_m) ** 2)
+        chi2_grid[i], _ = _profile_chi2_grid_over_s1(d_m, theta_m, w_m, mom2_m, nuisance_terms, s1_grid)
+
+    return {"vsys_grid_kms": vsys_grid, "s1_grid_kms": s1_grid, "s1_best": s1_best,
+            "chi2_best": chi2_best, "chi2_grid": chi2_grid, "vsys0_kms": vsys0}
+
+
+# --------------------------------------------------------------------------
+# 5.9 main()
+# --------------------------------------------------------------------------
+
+
+def n_effective(n_pix, ppb):
+    return n_pix / ppb
+
+
+def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng):
+    xc, yc = float(ringlog_row["XPOS(pix)"]), float(ringlog_row["YPOS(pix)"])
+    pa0 = float(ringlog_row["P.A.(deg)"])
+    inc = float(ringlog_row["INC(deg)"])
+    vsys = float(ringlog_row["VSYS(km/s)"])
+    vrot = float(ringlog_row["VROT(km/s)"])
+    r_in, r_out = float(ringlog_row["r_in_arcsec"]), float(ringlog_row["r_out_arcsec"])
+
+    R_pix, theta_full = make_geometry(mapset.shape, xc, yc, pa0, inc, cdelt1_sign)
+    R_arcsec = R_pix * mapset.pixscale_arcsec
+
+    base_mask_raw = ring_mask(R_arcsec, r_in, r_out, mapset.data_mom1, mapset.data_mom2)
+    quality_mask = data_quality_mask(mapset.data_mom2, cfg.sigma_artifact_floor_kms)
+    base_mask = base_mask_raw & quality_mask
+    n_removed_by_quality_mask = int(np.sum(base_mask_raw & ~quality_mask))
+
+    ppb = pixels_per_beam(mapset.bmaj_deg, mapset.bmin_deg, mapset.cdelt1_deg, mapset.cdelt2_deg)
+    cell_side_pix = int(np.ceil(np.sqrt(ppb)))
+    y_idx, x_idx = np.indices(mapset.shape)
+    cell_id_full = beam_cell_ids(y_idx, x_idx, cell_side_pix, mapset.shape[1])
+
+    cos_t_full = np.cos(theta_full)
+    side_masks = {
+        "both": base_mask,
+        "receding": base_mask & (cos_t_full > 0),
+        "approaching": base_mask & ~(cos_t_full > 0),
+    }
+
+    rows = []
+    maps_extra = {"R_arcsec": R_arcsec, "theta": theta_full, "ring_mask_both": base_mask}
+
+    for side in SIDES:
+        mask = side_masks[side]
+        n_pix = int(np.sum(mask))
+        if n_pix < len(cfg.model_terms) + 1:
+            warnings.warn(f"Ring {ring_idx} side={side}: only {n_pix} pixels, skipping.")
+            continue
+
+        theta_m = theta_full[mask]
+        mom1_m = mapset.data_mom1[mask]
+        mom2_m = mapset.data_mom2[mask]
+        cell_id_m = cell_id_full[mask]
+        d_m = build_data_vector(mom1_m, vsys, inc, vrot, theta_m)
+
+        n_eff = n_effective(n_pix, ppb)
+
+        for scheme in cfg.weighting_schemes:
+            w_m = compute_weights(theta_m, mom2_m, scheme, cfg.sigma_floor_kms)
+            fit_r = fit_wls(d_m, theta_m, w_m, mom2_m, cfg.model_terms)
+            L0, L1 = leakage_diagnostics(theta_m, w_m)
+            rms = rms_about_zero(fit_r.resid)
+            chi2 = float(np.sum((fit_r.resid / mom2_m) ** 2))
+
+            boot_draws, n_cells = block_bootstrap_s1(
+                d_m, theta_m, mom2_m, cell_id_m, scheme, cfg.sigma_floor_kms,
+                cfg.model_terms, cfg.n_bootstrap, rng,
+            )
+            lo, med, hi = np.percentile(boot_draws, [16, 50, 84])
+
+            row = dict(
+                ring_index=ring_idx,
+                r_in_arcsec=r_in,
+                r_out_arcsec=r_out,
+                r_center_kpc=float(ringlog_row["r_center_kpc"]),
+                side=side,
+                weighting=scheme,
+                s1=fit_r.value("s1"),
+                s1_formal_err=fit_r.err("s1"),
+                s1_boot_lo=float(lo),
+                s1_boot_med=float(med),
+                s1_boot_hi=float(hi),
+                c0=fit_r.value("c0") if "c0" in cfg.model_terms else np.nan,
+                c0_err=fit_r.err("c0") if "c0" in cfg.model_terms else np.nan,
+                c2=fit_r.value("c2") if "c2" in cfg.model_terms else np.nan,
+                s2=fit_r.value("s2") if "s2" in cfg.model_terms else np.nan,
+                chi2=chi2,
+                n_pix=n_pix,
+                n_eff=n_eff,
+                n_cells=n_cells,
+                L0=L0,
+                L1=L1,
+                rms_residual=rms,
+                near_side_assumed="UNRESOLVED",
+                n_removed_quality_mask=n_removed_by_quality_mask,
+            )
+            rows.append(row)
+
+            if side == "both" and scheme == cfg.primary_weighting:
+                maps_extra["weights_primary"] = np.zeros(mapset.shape)
+                maps_extra["weights_primary"][mask] = w_m
+                dv_pre = np.full(mapset.shape, np.nan)
+                dv_pre[mask] = d_m
+                dv_post = np.full(mapset.shape, np.nan)
+                dv_post[mask] = fit_r.resid
+                maps_extra["dv_prefit"] = dv_pre
+                maps_extra["dv_postfit"] = dv_post
+
+    pa_result = pa_scan(cfg, ringlog_row, mapset, side_masks["both"], xc, yc, inc, vrot, vsys, cdelt1_sign)
+    vsys_result = vsys_scan(cfg, ringlog_row, mapset, side_masks["both"], xc, yc, pa0, inc, vrot, vsys, cdelt1_sign)
+
+    n_eff_both = n_effective(int(np.sum(side_masks["both"])), ppb)
+    scale = n_eff_both / max(np.min(pa_result["chi2_grid"]), 1e-30)
+    pa_result["chi2_grid"] *= scale
+    pa_result["chi2_best"] *= scale
+    vsys_result["chi2_grid"] *= scale
+    vsys_result["chi2_best"] *= scale
+    pa_result["chi2_rescale_note"] = "rescaled so chi2_min/n_eff = 1: a calibration to n_eff, not a noise-model claim"
+    vsys_result["chi2_rescale_note"] = pa_result["chi2_rescale_note"]
+
+    return rows, maps_extra, pa_result, vsys_result
+
+
+def main(cfg: Config):
+    print(f"[harmonic_fit] RAD convention: ring center (RAD +/- width/2)")
+    ringlog = read_ringlog(cfg.ringlog_path)
+    print(f"[harmonic_fit] Ring bounds (arcsec):")
+    for row in ringlog:
+        print(f"    ring: {row['r_in_arcsec']:.2f} -- {row['r_out_arcsec']:.2f}  "
+              f"(VROT={row['VROT(km/s)']:.1f} km/s, INC={row['INC(deg)']:.2f} deg, PA={row['P.A.(deg)']:.2f} deg)")
+    print(f"[harmonic_fit] kpc_per_arcsec = {ringlog.meta['kpc_per_arcsec']:.5f}")
+
+    mapset = load_maps(cfg.maps_dir)
+    cdelt1_sign = -1 if mapset.cdelt1_deg < 0 else (1 if mapset.cdelt1_deg > 0 else 0)
+    print(f"[harmonic_fit] CDELT1 = {mapset.cdelt1_deg} deg/pix (sign={cdelt1_sign}); "
+          f"pixel scale = {mapset.pixscale_arcsec:.3f} arcsec/pix")
+
+    # Section 2.3 assertion -- fire on the outermost ring, once, before trusting anything else.
+    outer_row = ringlog[-1]
+    xc0, yc0 = float(outer_row["XPOS(pix)"]), float(outer_row["YPOS(pix)"])
+    pa00, inc0 = float(outer_row["P.A.(deg)"]), float(outer_row["INC(deg)"])
+    vsys0 = float(outer_row["VSYS(km/s)"])
+    R_pix0, theta0 = make_geometry(mapset.shape, xc0, yc0, pa00, inc0, cdelt1_sign)
+    outer_mask0 = ring_mask(R_pix0 * mapset.pixscale_arcsec, 0.0, float(outer_row["r_out_arcsec"]),
+                             mapset.model_mom1, mapset.model_mom1)
+    mean_rec, mean_app = assert_receding_side(theta0, mapset.model_mom1, vsys0, outer_mask0)
+    print(f"[harmonic_fit] Receding-side assertion PASSED: "
+          f"mean(model-VSYS)|receding={mean_rec:.2f}, |approaching={mean_app:.2f}")
+
+    cfg.results_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(cfg.random_seed)
+
+    all_rows = []
+    all_maps = {}
+    all_scans = {}
+    for ring_idx, ringlog_row in enumerate(ringlog):
+        rows, maps_extra, pa_result, vsys_result = process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng)
+        all_rows.extend(rows)
+        for k, v in maps_extra.items():
+            all_maps[f"ring{ring_idx}_{k}"] = v
+        for k, v in pa_result.items():
+            if k != "chi2_rescale_note":
+                all_scans[f"ring{ring_idx}_pa_{k}"] = v
+        for k, v in vsys_result.items():
+            if k != "chi2_rescale_note":
+                all_scans[f"ring{ring_idx}_vsys_{k}"] = v
+
+    results_table = Table(rows=all_rows)
+    results_table.meta["rad_convention"] = "RAD = ring center"
+    results_table.meta["primary_weighting"] = cfg.primary_weighting
+    results_table.meta["kpc_per_arcsec"] = ringlog.meta["kpc_per_arcsec"]
+    results_table.meta["config"] = {
+        k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.__dict__.items()
+    }
+
+    ecsv_path = cfg.results_dir / "ring_results.ecsv"
+    results_table.write(ecsv_path, format="ascii.ecsv", overwrite=True)
+    print(f"[harmonic_fit] Wrote {ecsv_path}")
+
+    np.savez(cfg.results_dir / "maps.npz", **all_maps)
+    print(f"[harmonic_fit] Wrote {cfg.results_dir / 'maps.npz'}")
+
+    np.savez(cfg.results_dir / "scans.npz", **all_scans)
+    print(f"[harmonic_fit] Wrote {cfg.results_dir / 'scans.npz'}")
+
+    print("\n[harmonic_fit] Summary (side=both, primary weighting):")
+    print(f"{'ring':<6}{'r_in':>8}{'r_out':>8}{'s1':>10}{'boot_lo':>10}{'boot_hi':>10}{'c0':>10}{'chi2':>10}{'n_eff':>8}")
+    for row in all_rows:
+        if row["side"] == "both" and row["weighting"] == cfg.primary_weighting:
+            print(f"{row['ring_index']:<6}{row['r_in_arcsec']:8.2f}{row['r_out_arcsec']:8.2f}"
+                  f"{row['s1']:10.2f}{row['s1_boot_lo']:10.2f}{row['s1_boot_hi']:10.2f}"
+                  f"{row['c0']:10.2f}{row['chi2']:10.1f}{row['n_eff']:8.1f}")
+
+    return results_table
+
+
+# --------------------------------------------------------------------------
+# 8. Self-tests
+# --------------------------------------------------------------------------
+
+
+def _synthetic_mapset_and_ringlog(shape=(48, 48)):
+    """Build a synthetic MapSet + ringlog on the real pixel grid, geometry
+    taken from stage_1_opt_parameters.txt so tests exercise the real WCS."""
+    ringlog_path = Path(__file__).parent / "stage_1_opt_parameters.txt"
+    ringlog = read_ringlog(ringlog_path)
+
+    xc = float(ringlog[0]["XPOS(pix)"])
+    yc = float(ringlog[0]["YPOS(pix)"])
+    pa0 = float(ringlog[0]["P.A.(deg)"])
+    inc0 = float(ringlog[0]["INC(deg)"])
+    vsys0 = float(ringlog[0]["VSYS(km/s)"])
+
+    return ringlog, dict(shape=shape, xc=xc, yc=yc, pa0=pa0, inc0=inc0, vsys0=vsys0)
+
+
+def _build_synthetic_mom1(shape, xc, yc, pa_deg, inc_deg, vsys, vrot_of_R, vrad_kms, cdelt1_sign=-1, extra_offset=0.0):
+    R_pix, theta = make_geometry(shape, xc, yc, pa_deg, inc_deg, cdelt1_sign)
+    vrot = vrot_of_R(R_pix)
+    v_los = vsys + extra_offset + np.sin(np.radians(inc_deg)) * (vrot * np.cos(theta) + vrad_kms * np.sin(theta))
+    return v_los, R_pix, theta
+
+
+def selftest():
+    n_pass = 0
+    n_fail = 0
+
+    def check(name, cond, detail=""):
+        nonlocal n_pass, n_fail
+        status = "PASS" if cond else "FAIL"
+        print(f"[selftest] {name}: {status} {detail}")
+        if cond:
+            n_pass += 1
         else:
-            v_ring_binned[j] = np.nan
-            
-    binned_profiles.append(v_ring_binned)
+            n_fail += 1
 
-print("-" * 100)
-overall_red_chi2 = total_chi2 / total_dof if total_dof > 0 else np.nan
-print(f"{'OVERALL MODEL':<15} | {'-':<10} | {'-':<10} | {'-':<10} | {total_dof:8d} | {total_chi2:10.1f} | {overall_red_chi2:8.2f}")
-print("-"*100 + "\n")
+    ringlog, geo = _synthetic_mapset_and_ringlog()
+    shape, xc, yc, pa0, inc0, vsys0 = geo["shape"], geo["xc"], geo["yc"], geo["pa0"], geo["inc0"], geo["vsys0"]
+
+    def vrot_of_R_flat(R_pix):
+        return np.full_like(R_pix, 300.0)
+
+    # ---------------- Test 1: synthetic recovery ----------------
+    v_los, R_pix, theta = _build_synthetic_mom1(shape, xc, yc, pa0, inc0, vsys0, vrot_of_R_flat, 25.0)
+    R_arcsec = R_pix * 4.0  # pixscale from the real header (verified separately in load_maps)
+    mom2 = np.full(shape, 10.0)
+
+    ok1 = True
+    for ring_idx, row in enumerate(ringlog):
+        r_in, r_out = float(row["r_in_arcsec"]), float(row["r_out_arcsec"])
+        mask = ring_mask(R_arcsec, r_in, r_out, v_los, mom2)
+        theta_m = theta[mask]
+        d_m = build_data_vector(v_los[mask], vsys0, inc0, 300.0, theta_m)
+        for scheme in ("uniform", "sin2", "invvar"):
+            w_m = compute_weights(theta_m, mom2[mask], scheme, 5.0)
+            fit_r = fit_wls(d_m, theta_m, w_m, mom2[mask], ("c0", "s1"))
+            if abs(fit_r.value("s1") - 25.0) > 0.5:
+                ok1 = False
+    check("1. Synthetic recovery (s1=25+/-0.5 km/s, all rings/weightings)", ok1)
+
+    # ---------------- Test 2: PA degeneracy ----------------
+    v_los2, R_pix2, theta2 = _build_synthetic_mom1(shape, xc, yc, pa0, inc0, vsys0, vrot_of_R_flat, 0.0)
+    R_arcsec2 = R_pix2 * 4.0
+    pa_offset_deg = 2.0
+    _, theta_wrong = make_geometry(shape, xc, yc, pa0 + pa_offset_deg, inc0, -1)
+    row0 = ringlog[0]
+    mask2 = ring_mask(R_arcsec2, float(row0["r_in_arcsec"]), float(row0["r_out_arcsec"]), v_los2, mom2)
+    theta_m2 = theta_wrong[mask2]
+    d_m2 = build_data_vector(v_los2[mask2], vsys0, inc0, 300.0, theta_m2)
+    w_m2 = compute_weights(theta_m2, mom2[mask2], "sin2", 5.0)
+    fit2 = fit_wls(d_m2, theta_m2, w_m2, mom2[mask2], ("c0", "s1"))
+    # Inclination-corrected slope (CLAUDE.md 5.6) -- the flat-sky -VROT*dPA is
+    # NOT accurate at finite inclination; evaluated at the wrong-PA theta/weights
+    # since that is what the fit actually sees.
+    slope = pa_degeneracy_slope(theta_m2, w_m2, 300.0, inc0)
+    expected = slope * np.radians(pa_offset_deg)
+    rel_err = abs((fit2.value("s1") - expected) / expected)
+    check("2. PA degeneracy (s1 ~= VROT*K*dPA[rad] within 5%, inclination-corrected)", rel_err < 0.05,
+          f"(got s1={fit2.value('s1'):.3f}, expected={expected:.3f}, rel_err={rel_err:.3%})")
+
+    # ---------------- Test 3: receding-side assertion fires ----------------
+    _, theta_flipped = make_geometry(shape, xc, yc, pa0 + 180.0, inc0, -1)
+    outer_row = ringlog[-1]
+    outer_mask = ring_mask(R_pix2 * 4.0, 0.0, float(outer_row["r_out_arcsec"]), v_los2, v_los2)
+    raised = False
+    try:
+        assert_receding_side(theta_flipped, v_los2, vsys0, outer_mask)
+    except RuntimeError:
+        raised = True
+    check("3. Receding-side assertion fires on 180-deg-flipped PA", raised)
+
+    # ---------------- Test 4: leakage ----------------
+    # An idealized synthetic ring (continuous, uniformly-sampled theta), not
+    # the real pixel grid: pixelization of an annulus on a Cartesian grid is
+    # not perfectly theta-symmetric even for a "full" ring, which would fail
+    # the 1e-10 tolerance for reasons unrelated to the leakage formulas being
+    # tested here.
+    theta_ideal = np.linspace(-np.pi, np.pi, 100_000, endpoint=False)
+    sigma_ideal = np.ones_like(theta_ideal) * 10.0
+    ok4a = True
+    for scheme in ("uniform", "sin2", "invvar"):
+        w4 = compute_weights(theta_ideal, sigma_ideal, scheme, 5.0)
+        L0, L1 = leakage_diagnostics(theta_ideal, w4)
+        if abs(L0) > 1e-10 or abs(L1) > 1e-10:
+            ok4a = False
+    wedge_mask = ~((np.degrees(theta_ideal) % 360 >= 40) & (np.degrees(theta_ideal) % 360 < 80))
+    w4w = compute_weights(theta_ideal[wedge_mask], sigma_ideal[wedge_mask], "sin2", 5.0)
+    L0w, L1w = leakage_diagnostics(theta_ideal[wedge_mask], w4w)
+    ok4b = (abs(L0w) > 1e-6) or (abs(L1w) > 1e-6)
+    check("4. Leakage: |L0|,|L1| < 1e-10 unmasked; measurably nonzero with a blanked wedge", ok4a and ok4b,
+          f"(unmasked_ok={ok4a}, wedge L0={L0w:.2e} L1={L1w:.2e})")
+
+    # ---------------- Test 5: analytic agreement with curve_fit ----------------
+    # curve_fit used ONLY here, as an independent cross-check of the linear
+    # solve -- never as the estimator in the pipeline itself (CLAUDE.md 9).
+    from scipy.optimize import curve_fit as _curve_fit
+
+    row5 = ringlog[2]
+    v_los5, R_pix5, theta5 = _build_synthetic_mom1(shape, xc, yc, pa0, inc0, vsys0, vrot_of_R_flat, 18.0)
+    R_arcsec5 = R_pix5 * 4.0
+    mom2_5 = np.random.default_rng(0).uniform(5.0, 15.0, size=shape)
+    mask5 = ring_mask(R_arcsec5, float(row5["r_in_arcsec"]), float(row5["r_out_arcsec"]), v_los5, mom2_5)
+    theta_m5 = theta5[mask5]
+    d_m5 = build_data_vector(v_los5[mask5], vsys0, inc0, 300.0, theta_m5)
+    sigma_m5 = mom2_5[mask5]
+    w_m5 = compute_weights(theta_m5, sigma_m5, "invvar", 5.0)
+
+    fit5 = fit_wls(d_m5, theta_m5, w_m5, sigma_m5, ("s1",))
+
+    def model_s1_only(t, s1):
+        return s1 * np.sin(t)
+
+    popt, _ = _curve_fit(model_s1_only, theta_m5, d_m5, p0=[0.0], sigma=sigma_m5, absolute_sigma=True)
+    check("5. Analytic solve matches curve_fit to machine precision (invvar, 1 param)",
+          np.isclose(fit5.value("s1"), popt[0], atol=1e-8, rtol=1e-8),
+          f"(solve={fit5.value('s1'):.10f}, curve_fit={popt[0]:.10f})")
+
+    # ---------------- Test 6: round trip (V_z into c0, not s1) ----------------
+    v_los6a, R_pix6, theta6 = _build_synthetic_mom1(shape, xc, yc, pa0, inc0, vsys0, vrot_of_R_flat, 25.0, extra_offset=0.0)
+    v_los6b, _, _ = _build_synthetic_mom1(shape, xc, yc, pa0, inc0, vsys0, vrot_of_R_flat, 25.0, extra_offset=12.3)
+    R_arcsec6 = R_pix6 * 4.0
+    row6 = ringlog[0]
+    mask6 = ring_mask(R_arcsec6, float(row6["r_in_arcsec"]), float(row6["r_out_arcsec"]), v_los6a, mom2)
+    theta_m6 = theta6[mask6]
+
+    d_a = build_data_vector(v_los6a[mask6], vsys0, inc0, 300.0, theta_m6)
+    d_b = build_data_vector(v_los6b[mask6], vsys0, inc0, 300.0, theta_m6)
+    w_m6 = compute_weights(theta_m6, mom2[mask6], "sin2", 5.0)
+    fit_a = fit_wls(d_a, theta_m6, w_m6, mom2[mask6], ("c0", "s1"))
+    fit_b = fit_wls(d_b, theta_m6, w_m6, mom2[mask6], ("c0", "s1"))
+    dc0 = fit_b.value("c0") - fit_a.value("c0")
+    ds1 = fit_b.value("s1") - fit_a.value("s1")
+    # The offset is injected into V_los (mom1), so after build_data_vector's
+    # /sin(inc) it lands in c0 as offset/sin(inc), not the raw offset.
+    expected_dc0 = 12.3 / np.sin(np.radians(inc0))
+    check("6. Round trip: constant V_z-like offset (12.3 km/s in V_los) appears in c0, not s1",
+          np.isclose(dc0, expected_dc0, atol=1e-6) and np.isclose(ds1, 0.0, atol=1e-6),
+          f"(dc0={dc0:.4f}, expected={expected_dc0:.4f}, ds1={ds1:.6f})")
+
+    print(f"\n[selftest] {n_pass} passed, {n_fail} failed")
+    return n_fail == 0
 
 
-### AZIMUTHAL PROFILE
-fig, ax1 = plt.subplots() 
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
 
-# Shading
-ax1.axvspan(90, 270, facecolor='#F7F8FF', alpha=0.8, zorder=0)  
-ax1.axvspan(270, 450, facecolor='#FFF7F7', alpha=0.8, zorder=0) 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--project-dir", default=str(Path(__file__).parent))
+    args = parser.parse_args()
 
+    if args.selftest:
+        ok = selftest()
+        sys.exit(0 if ok else 1)
 
-ax1.text(180, text_label_height, 'Approaching', color='darkblue', ha='center', va='top', 
-         fontweight='bold', fontsize=22, transform=ax1.get_xaxis_transform(), zorder=10)
-ax1.text(360, text_label_height, 'Receding', color='darkred', ha='center', va='top', 
-         fontweight='bold', fontsize=22, transform=ax1.get_xaxis_transform(), zorder=10)
-
-colors = ['darkblue', 'magenta', 'green', 'red']
-markers = ['o', 's', '^', 'D']
-theta_smooth_deg = np.linspace(0, 360, 200)
-
-for i, (binned_data, fit_curve, arcsec_bounds) in enumerate(zip(binned_profiles, fit_curves, rings_arcsec)):
-    label_str = f"{arcsec_bounds[0]}'' - {arcsec_bounds[1]}''"
-    
-    # Shift data points
-    theta_centers_shifted = np.where(theta_centers < 90, theta_centers + 360, theta_centers)
-    sort_idx = np.argsort(theta_centers_shifted)
-    tc_plot = theta_centers_shifted[sort_idx]
-    bd_plot = binned_data[sort_idx]
-    
-    # Shift curves
-    theta_smooth_shifted = np.where(theta_smooth_deg < 90, theta_smooth_deg + 360, theta_smooth_deg)
-    sort_smooth_idx = np.argsort(theta_smooth_shifted)
-    ts_plot = theta_smooth_shifted[sort_smooth_idx]
-    fc_plot = fit_curve[sort_smooth_idx]
-    
-    ax1.plot(tc_plot, bd_plot, marker=markers[i], linestyle='None', color=colors[i], markersize=8, 
-             mfc='none', alpha=1, zorder=3)
-    
-    ax1.plot(ts_plot, fc_plot, linestyle='--', color=colors[i], 
-             linewidth=2.0, label=label_str, zorder=2, alpha =0.6)
-
-ax1.set_xlabel(r'Azimuth [$^{\circ}$]')
-ax1.set_ylabel(r'$(V_{\rm LOS} - V_{\rm sys}) / \sin(i)$ [km s$^{-1}$]')
-
-leg = ax1.legend(loc='upper left', framealpha=0.9, fontsize=22)
-leg.set_zorder(5)
-
-ax1.set_xlim(90, 450)
-ticks = np.arange(90, 451, 45)
-ax1.set_xticks(ticks)
-ax1.set_xticklabels([f"{t}" if t <= 360 else f"{t - 360}" for t in ticks])
-ax1.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.8)
-
-ax1.xaxis.set_minor_locator(AutoMinorLocator(5)) 
-ax1.yaxis.set_minor_locator(AutoMinorLocator(5))
-
-# Inset map
-ax_inset = fig.add_axes(inset_pos)
-vmax_disp = np.nanmax(np.abs(data_mom1 - V_sys))
-ax_inset.imshow(data_mom1, origin='lower', cmap='RdBu_r', 
-                vmin=V_sys - vmax_disp, vmax=V_sys + vmax_disp)
-
-all_edges_pix = set([r[0] for r in rings_pix] + [r[1] for r in rings_pix])
-for r_edge in all_edges_pix:
-    ellipse = patches.Ellipse(
-        xy=(x_c, y_c), width=2 * r_edge, height=2 * r_edge * np.cos(inc_rad), 
-        angle=PA_deg, edgecolor='black', facecolor='none', 
-        linewidth=0.8, alpha=0.6, linestyle=':'
+    project_dir = Path(args.project_dir)
+    cfg = Config(
+        project_dir=project_dir,
+        maps_dir=project_dir / "maps",
+        ringlog_path=project_dir / "stage_1_opt_parameters.txt",
+        results_dir=project_dir / "results",
     )
-    ax_inset.add_patch(ellipse)
-
-spike_angles = np.arange(0, 360, 45)
-spike_length = rings_pix[-1][1]  
-
-for ang in spike_angles:
-    ang_rad = np.radians(ang)
-    dx_rot_spike = spike_length * np.cos(ang_rad)
-    dy_deproj_spike = spike_length * np.sin(ang_rad)
-    dy_rot_spike = dy_deproj_spike * np.cos(inc_rad)
-    
-    dx_spike = dx_rot_spike * np.cos(PA_rad) - dy_rot_spike * np.sin(PA_rad)
-    dy_spike = dx_rot_spike * np.sin(PA_rad) + dy_rot_spike * np.cos(PA_rad)
-    
-    ax_inset.plot([x_c, x_c + dx_spike], [y_c, y_c + dy_spike], color='black', linewidth=1, linestyle='-', alpha=0.8)
-    text_pad = 1.25
-    ax_inset.text(x_c + dx_spike * text_pad, y_c + dy_spike * text_pad, f"{ang}°", 
-                  color='black', fontsize=22, ha='center', va='center', weight='bold')
-
-ax_inset.plot(x_c, y_c, marker='+', color='black', markersize=8)
-ax_inset.set_xlim(x_c - inset_zoom_pix, x_c + inset_zoom_pix)
-ax_inset.set_ylim(y_c - inset_zoom_pix, y_c + inset_zoom_pix)
-ax_inset.tick_params(axis='both', which='both', direction='in', color='black', length=3)
-ax_inset.set_xticklabels([])
-ax_inset.set_yticklabels([])
-
-for spine in ax_inset.spines.values():
-    spine.set_edgecolor('black')
-    spine.set_linewidth(1.5)
-
-plt.savefig("20_target_harmonic_fit_azimuthal.pdf", bbox_inches='tight')
-
-
-
-
-
-
-### RADIAL VELOCITY PROFILE
-
-fig2, ax_vrad = plt.subplots(figsize=(10, 8))
-rc_arcsec_arr = np.array(ring_centers_arcsec)
-
-# 1. Harmonic fit (A - Blue)
-v_rad_outflow_app = np.abs(v_rad_app_array)
-ax_vrad.errorbar(rc_arcsec_arr, v_rad_outflow_app, yerr=rms_app_array, 
-                 fmt='s', color='blue', markeredgecolor='black', label='Approaching', 
-                 capsize=4, elinewidth=1.5, zorder=5)
-
-# 2. Harmonic fit (B - Green)
-v_rad_outflow = np.abs(v_rad_fits_array)
-ax_vrad.errorbar(rc_arcsec_arr, v_rad_outflow, yerr=rms_array, 
-                 fmt='o', color='green', markeredgecolor='black', label='Both', 
-                 capsize=4, elinewidth=1.5, zorder=6)
-
-# 3.  Harmonic fit (R - Red)
-v_rad_outflow_rec = np.abs(v_rad_rec_array)
-ax_vrad.errorbar(rc_arcsec_arr, v_rad_outflow_rec, yerr=rms_rec_array, 
-                 fmt='^', color='red', markeredgecolor='black', label='Receding', 
-                 capsize=4, elinewidth=1.5, zorder=5)
-
-# 4. TRM Fit Values
-trm_vrad = np.array([np.nan, 60.000, 60.000, np.nan])
-trm_err_lower = [np.nan, 57.054, 46.511, np.nan]
-trm_err_upper = [np.nan, 65.422, 52.001, np.nan]
-trm_yerr = [trm_err_lower, trm_err_upper]
-
-
-# ax_vrad.errorbar(rc_arcsec_arr, trm_vrad, yerr=trm_yerr, 
-#                  fmt='s', color='#8A0081', label='TRM fit', 
-#                  capsize=5, capthick=2, markersize=10, elinewidth=2, zorder=4)
-
-# VERTICAL LINES & SHADING 
-val1_arcsec = 73.2228 / 2
-val2_arcsec = 148 / 2
-
-ax_vrad.axvspan(val1_arcsec, val2_arcsec, color='lightgray', alpha=0.5, zorder=0)
-ax_vrad.axvline(val1_arcsec, color='gray', linestyle='--', linewidth=1.5, zorder=1)
-ax_vrad.axvline(val2_arcsec, color='gray', linestyle='--', linewidth=1.5, zorder=1)
-
-ax_vrad.set_xlim(0, 80.5)
-
-ax_vrad.set_ylim(bottom=0)
-_, ymax = ax_vrad.get_ylim()
-ax_vrad.set_ylim(-18, ymax + 10) 
-
-ax_vrad.set_ylabel(r'$V_{\rm rad}$ [km s$^{-1}$]')
-ax_vrad.set_xlabel('Radius [arcsec]')
-ax_vrad.tick_params(axis='y', labelrotation=90)
-
-# Right Y-Axis
-ax_right = ax_vrad.twinx()
-ax_right.set_ylim(ax_vrad.get_ylim())
-ax_right.set_yticklabels([]) 
-ax_right.minorticks_on()
-ax_right.tick_params(direction='in')
-
-# Top X-Axis
-ax_top = ax_vrad.twiny()
-xlim_as = ax_vrad.get_xlim()
-xlim_kpc = (xlim_as[0] * KPC_PER_ARCSEC, xlim_as[1] * KPC_PER_ARCSEC)
-ax_top.set_xlim(xlim_kpc)
-ax_top.set_xlabel('Radius [kpc]', labelpad=10)
-ax_top.minorticks_on()
-ax_vrad.minorticks_on()
-
-
-handles, labels = ax_vrad.get_legend_handles_labels()
-ax_vrad.legend(handles, labels, loc='lower left', ncol=1, fontsize=25)
-
-plt.tight_layout()
-plt.savefig("20_target_vrad_profile.pdf", bbox_inches='tight')
-
-plt.show()
+    main(cfg)

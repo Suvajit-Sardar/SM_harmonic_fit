@@ -216,6 +216,7 @@ weighting_schemes       : ("uniform", "sin2", "invvar")
 primary_weighting       : "sin2"
 model_terms             : ("c0", "s1")                 # c1 always fixed
 sigma_floor_kms         : 5.0                          # weight clipping only
+sigma_artifact_floor_kms: 0.5                          # data-quality mask, see 5.3
 pa_scan_halfwidth_deg   : 15.0
 pa_scan_step_deg        : 0.25
 vsys_scan_halfwidth_kms : 20.0
@@ -259,6 +260,29 @@ inside the annulus.
 **Do not reproduce the old `v_err_map >= 5.0` pixel cut.** That removed real
 low-dispersion pixels from the fit. The dispersion floor belongs only in the
 `invvar` weighting, applied as `sigma = np.maximum(mom2, sigma_floor_kms)`.
+
+**Separately, apply a data-quality mask for near-zero data `mom2`.** On this
+dataset, `mom2` is empirically bimodal: values are either `< 4e-4 km/s` or
+`>= 2.75 km/s` — a four-order-of-magnitude gap, nothing in between (~20% of
+finite pixels fall in the near-zero cluster, and they correlate almost
+exactly with low-`mom0` / low-S/N pixels near the edge of the detection).
+This is a numerical collapse of SoFiA's linewidth estimate at marginal S/N,
+not real narrow-but-detected HI linewidth, and it is a *different* failure
+mode from the prohibited `>= 5.0` cut above: that one discarded genuine
+low-but-nonzero dispersion measurements; this one discards pixels where the
+measurement itself is pathological. Section 5.8 requires **raw, unfloored**
+`mom2` as the chi2/covariance sigma so `delta chi2` stays meaningful — with
+these pixels included unmasked, a handful of near-`1e-5`-km/s sigmas inflate
+chi2 by ~10 orders of magnitude and make every chi2-based diagnostic (PA/VSYS
+contour figures, the `chi2_min/n_eff` calibration) meaningless.
+
+Add `sigma_artifact_floor_kms` to the config (Section 5.1) and exclude
+`mom2 < sigma_artifact_floor_kms` from `ring_mask` for **data** mom2 only
+(never applied to the model). A value anywhere in the empirical gap works;
+use `0.5 km/s` — comfortably inside the gap, nowhere near the `5.0 km/s`
+threshold of the prohibited cut, so there is no ambiguity between the two.
+Report the number of pixels this removes per ring in the results table
+metadata so the cut stays visible.
 
 ### 5.4 Weighting
 
@@ -324,8 +348,49 @@ per ring and per side; they are the quantitative justification for holding `VSYS
 and `VROT` fixed.
 
 Note the asymmetry that motivates the whole error budget: a PA error contributes
-`-VROT * dPA * sin(theta)`, which is *the same harmonic as the signal*. No
+a term in `sin(theta)`, which is *the same harmonic as the signal*. No
 weighting scheme can suppress it. PA is the only first-order leak.
+
+**The naive coefficient `-VROT * dPA` is a flat-sky approximation and is not
+accurate at this galaxy's inclination.** A PA error does not shift `theta` by
+a uniform `dPA` once you deproject through `cos(inc)` — differentiating
+`make_geometry` gives, to first order in a small PA offset `dPA` (radians):
+
+```
+dtheta/d(dPA) = -(cos(theta)^2/cos(inc) + cos(inc)*sin(theta)^2)   ≡ g(theta)
+```
+
+which ranges from `-1/cos(inc)` on the major axis to `-cos(inc)` on the minor
+axis — not a constant `-1`. Propagating this through the weighted `s1`
+estimator (projecting the induced residual `VROT*dPA*g(theta)*sin(theta)` onto
+the `sin(theta)` basis under weight `w(theta)`) gives the leakage slope:
+
+```
+K(scheme) = sum(w * g(theta) * sin(theta)**2) / sum(w * sin(theta)**2)
+s1_leak   = VROT * dPA[rad] * K(scheme)
+```
+
+evaluated over the same fixed pixel set used by the PA scan. Closed forms for
+constant-`sigma` weighting (uniform and, when `sigma` is ~constant over the
+ring, invvar too), with `ci = cos(inc)`:
+
+```
+K_uniform = -(1/4) * (1/ci + 3*ci)
+K_sin2    = -(1/6) * (1/ci + 5*ci)
+```
+
+At this galaxy's inclination (`INC = 49.345 deg`, `ci = 0.6515`):
+`K_uniform ≈ -0.872`, `K_sin2 ≈ -0.799` — i.e. the true slope is **80–87% of
+the naive `-VROT` value**, about `-4.2` to `-4.6 km/s/deg` at `VROT ≈ 300`
+km/s, not `-5.24 km/s/deg`. This was verified two independent ways: numerical
+finite-differencing of `make_geometry`, and the full weighted-LS fit recovering
+`K*VROT*dPA` to within 1%. **Use `K(scheme)`, not the flat-sky `-VROT`, for
+both the PA-degeneracy self-test (Section 8, test 2) and the analytic overlay
+line in `fig_pa_degeneracy` (Section 6.4).** For `invvar` weighting with
+spatially-varying `sigma` (i.e. on real, not synthetic, data), compute `K`
+numerically from the actual per-pixel `theta`, `w`, and `sigma` of the fixed
+scan mask rather than using the closed form, since `w` is then not a pure
+function of `theta` alone.
 
 ### 5.7 Bootstrap
 
@@ -373,8 +438,9 @@ Write:
 - `results/ring_results.ecsv` — one row per combination: `ring_index`,
   `r_in_arcsec`, `r_out_arcsec`, `r_center_kpc`, `side`, `weighting`, `s1`,
   `s1_formal_err`, `s1_boot_lo/med/hi`, `c0`, `c0_err`, `c2`, `s2` (if fitted),
-  `chi2`, `n_pix`, `n_eff`, `L0`, `L1`, `rms_residual`, plus the config and
-  `"RAD = ring center"` in the table metadata.
+  `chi2`, `n_pix`, `n_eff`, `L0`, `L1`, `rms_residual`, `n_removed_quality_mask`
+  (pixels dropped by the `sigma_artifact_floor_kms` cut, Section 5.3), plus the
+  config and `"RAD = ring center"` in the table metadata.
 - `results/maps.npz` — `theta`, `R_arcsec`, `weights` (primary scheme),
   `dv_prefit`, `dv_postfit`, `ring_mask_stack`.
 - `results/scans.npz` — the chi-squared cubes, grids, and `s1(PA)` curves.
@@ -450,11 +516,14 @@ weighting scheme.
    Should be structureless; any coherent pattern is the argument for adding
    `c2, s2`.
 7. **`fig_pa_degeneracy`** — per ring, filled `chi2(PA, s1)` contours at
-   `delta chi2 = 1, 4, 9`, with the analytic degeneracy line
-   `s1 = -VROT * (PA - PA_0)` overplotted. At `VROT ≈ 300` km/s the slope is
-   ≈ −5.24 km/s per degree. **This doubles as the acceptance test for the
-   geometry code**: if the numerical valley does not follow the analytic line,
-   something in the deprojection is wrong.
+   `delta chi2 = 1, 4, 9`, with the inclination-corrected analytic degeneracy
+   line `s1 = VROT * K(scheme) * (PA - PA_0)[rad]` overplotted (see Section
+   5.6 for `K`). At `VROT ≈ 300` km/s and this galaxy's inclination the slope
+   is ≈ −4.4 km/s per degree (`sin2`), not the flat-sky −5.24. **This doubles
+   as the acceptance test for the geometry code**: if the numerical valley
+   does not follow the inclination-corrected analytic line, something in the
+   deprojection is wrong — the flat-sky line will *not* match even for
+   correct code, so do not use it as the check.
 8. **`fig_vsys_degeneracy`** — same layout for `(VSYS, s1)`, presented
    deliberately as the contrast case: expected to be axis-aligned.
 9. **`fig_s1_vs_pa`** — `s1` against PA offset, one line per ring, on one axis.
@@ -509,8 +578,10 @@ result from real data is trusted.
    pipeline. Recover `s1 = 25 ± 0.5` km/s in every ring, all three weighting
    schemes. This is the single most valuable test in the project.
 2. **PA degeneracy.** Inject `V_rad = 0`, then fit with PA offset by `+2°`.
-   Recover `s1 ≈ -VROT * 2° in radians` (≈ −10.5 km/s at `VROT = 300`) to
-   within 5%. Confirms both the degeneracy and the analytic slope in figure 7.
+   Recover `s1 ≈ VROT * K(scheme) * 2° in radians` (the inclination-corrected
+   slope from Section 5.6, ≈ −8.4 to −9.2 km/s at `VROT = 300`, `INC = 49.345°`
+   — *not* the flat-sky ≈ −10.5) to within 5%. Confirms both the degeneracy and
+   the analytic slope in figure 7.
 3. **Receding-side assertion** fires correctly: flip `PA_math` by 180° in a mock
    and confirm the assertion raises.
 4. **Leakage.** On an unmasked synthetic ring, `|L0| < 1e-10` and `|L1| < 1e-10`
