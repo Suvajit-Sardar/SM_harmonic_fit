@@ -27,9 +27,7 @@ full specification this notebook and its two modules (`harmonic_fit.py`,
 
 **Ring-radius convention.** `stage_1_opt_parameters.txt` lists `RAD(arcs)`
 uniformly spaced by 9.7". `RAD` is the ring *center* (confirmed by the
-project owner), so ring *i* spans `RAD - 4.85" -> RAD + 4.85"`. This
-reproduces the ring bounds of the earlier single-file script exactly. There
-is no `rad_convention` toggle -- this is fixed, not configurable.
+project owner), so ring *i* spans `RAD - 4.85" -> RAD + 4.85"`.
 
 **Sign-convention caveat.** `s1 > 0` means outward motion *only if the near
 side of the disc is known*; inclination alone is degenerate under `i -> -i`.
@@ -37,14 +35,6 @@ Every table and figure below carries `near_side_assumed = "UNRESOLVED"`.
 Treat the sign of `s1` as a number to be interpreted with external
 information (dust lanes, trailing-arm assumption), not a ready-made
 inflow/outflow claim.
-
-**On the structure below.** `harmonic_fit.process_ring` bundles the fit, the
-PA/VSYS scans, and the bootstrap together per ring, because they share the
-same per-ring masks and weights -- splitting them into separate notebook
-cells would mean recomputing that geometry three times for no benefit. So
-there is one cell below ("Run the pipeline") that does all of the
-computation and writes `results/`; every figure after that point is read
-back from disk via `harmonic_plots.py`, which never re-fits anything.
 """)
 
 md(r"""
@@ -74,10 +64,9 @@ md(r"""
 ## Ring log and maps
 
 Everything physical (`VROT`, `INC`, `P.A.`, `XPOS`, `YPOS`, `VSYS`, ring
-radii, `kpc_per_arcsec`) comes from `stage_1_opt_parameters.txt` -- nothing
-here is hardcoded. The moment maps are matched by globbing `maps/` for
-`*_1mom.fits` / `*_2mom.fits` (data) and `*_local_1mom.fits` /
-`*_local_2mom.fits` (Barolo model).
+radii, `kpc_per_arcsec`) comes from `stage_1_opt_parameters.txt`. The moment
+maps are matched by globbing `maps/` for `*_1mom.fits` / `*_2mom.fits`
+(data) and `*_local_1mom.fits` / `*_local_2mom.fits` (Barolo model).
 """)
 
 code(r"""
@@ -93,14 +82,13 @@ ringlog["RAD(arcs)", "VROT(km/s)", "INC(deg)", "P.A.(deg)", "VSYS(km/s)", "r_in_
 """)
 
 md(r"""
-## Geometry and the Section 2.3 receding-side assertion
+## Geometry and the receding-side check
 
 `PA_math = PA_barolo + 90 deg` is only valid for an east-left image
 (`CDELT1 < 0`, `origin='lower'`); this is asserted from the header, not
-assumed. Before trusting anything downstream, we check the one thing that
-would have caught the old script's sign bug immediately: within the
-outermost ring, the *Barolo model* mom1 (not the data, so real non-circular
-motion can't confuse the test) must be redshifted of `VSYS` on the
+assumed. As a sanity check before fitting anything: within the outermost
+ring, the *Barolo model* mom1 (not the data, so real non-circular motion
+can't confuse the test) must be redshifted of `VSYS` on the
 `cos(theta) > 0` (receding) side and blueshifted on the other.
 """)
 
@@ -122,13 +110,10 @@ print(f"PASSED: mean(model-VSYS) receding={mean_rec:.2f} km/s, approaching={mean
 md(r"""
 ## Run the pipeline
 
-This single call performs, per ring: the weighted-LS fit (all three
-weighting schemes, all three sides), the leakage diagnostics, the block
-bootstrap over beam-sized cells, and the PA/VSYS scans with their chi2
-contour grids -- then writes `results/ring_results.ecsv`, `results/maps.npz`,
-and `results/scans.npz`. On this dataset (4 rings, ~50-100 pixels/ring) it
-takes a few seconds; it would dominate the runtime on a larger map or a much
-finer PA/VSYS grid.
+Fits `s1` per ring (all three weighting schemes, all three sides), runs the
+PA/VSYS scans, and bootstraps the statistical error -- then writes
+`results/ring_results.ecsv`, `results/maps.npz`, and `results/scans.npz`.
+Takes a few seconds on this dataset.
 """)
 
 code(r"""
@@ -136,18 +121,13 @@ results_table = hf.main(cfg)
 """)
 
 md(r"""
-## Figures 1-2: convention checks
+## Figure 1-2: convention checks
 
-Look at these before trusting anything else. `fig_theta_map` is now a
-three-panel figure (theta map, sign(cos theta), and `w(theta)` inside the
-mask all sharing one figure, each a full-frame map with all rings merged --
-the rings are disjoint annuli on the same pixel grid, so merging is exact)
--- this is the figure that makes the old sign bug impossible to miss, and
-also makes visible that `sin2` weighting concentrates the constraint near
-the minor axis. `fig_coverage` shows whether the `L0`/`L1` orthogonality
-protection actually holds for this data's (patchy) azimuthal coverage --
-this one stays one panel per ring, since a merged polar histogram would
-erase exactly the per-ring `L0`/`L1` comparison it exists for.
+`fig_theta_map` shows `theta`, the approaching/receding split, and the
+`w(theta)` weight map -- confirms the geometry and weighting look right
+before trusting anything downstream. `fig_coverage` shows the azimuthal
+coverage per ring with `L0`/`L1` printed on each panel: how much a `VSYS`
+or `VROT` error would leak into `s1` for this ring's specific coverage gaps.
 """)
 
 code(r"""
@@ -155,24 +135,6 @@ res = hp.load_results(cfg.results_dir)
 
 hp.fig_theta_map(res)
 hp.fig_coverage(res)
-None
-""")
-
-md(r"""
-## Figure 3: residual maps -- STOP and look at the pre-fit panel before continuing
-
-**The pre-fit panel is the most important diagnostic in the project.**
-Genuine axisymmetric radial motion appears as a clean dipole aligned with
-the minor axis. A localised blob, a one-sided feature, or something tracking
-tidal structure means a single `s1` per ring is the wrong model -- and given
-the group environment this target sits in, that possibility has to be ruled
-out before anything below is taken at face value. The post-fit panel (after
-subtracting `s1*sin(theta)`) should be structureless; any coherent pattern
-remaining is the argument for enabling `c2, s2`.
-""")
-
-code(r"""
-hp.fig_residual_maps(res)
 None
 """)
 
@@ -185,12 +147,12 @@ res.table
 """)
 
 md(r"""
-## Figure 4: azimuthal comparison
+## Figure 3: azimuthal comparison
 
-`fig_azimuthal_vlos` compares the data, the Barolo model (through the same
-wedges and mask, so it carries the same beam smearing), and the harmonic
-fit. Where data and Barolo diverge but data and the harmonic fit agree, that
-gap *is* the `s1` detection, shown directly.
+Data, the Barolo model (through the same wedges and mask, so it carries the
+same beam smearing), and the harmonic fit, all against azimuth. Where data
+and Barolo diverge but data and the harmonic fit agree, that gap *is* the
+`s1` detection, shown directly.
 """)
 
 code(r"""
@@ -199,18 +161,34 @@ None
 """)
 
 md(r"""
+## Figure 4: pre-fit and post-fit residual maps
+
+**The pre-fit panel (left) is the most important diagnostic in the
+project.** Genuine axisymmetric radial motion appears as a clean dipole
+aligned with the minor axis. A localised blob, a one-sided feature, or
+something tracking tidal structure means a single `s1` per ring is the
+wrong model -- worth ruling out given the group environment this target
+sits in. The post-fit panel (right, after subtracting `s1*sin(theta)`)
+should be structureless; any coherent pattern remaining is the argument for
+enabling `c2, s2`.
+""")
+
+code(r"""
+hp.fig_residual_maps(res)
+None
+""")
+
+md(r"""
 ## Figures 5-7: PA/VSYS degeneracy and s1 vs. PA offset
 
-These read the scan grids already computed in the pipeline cell above (no
-extra computation here). `fig_pa_degeneracy` doubles as an acceptance test
-for the geometry code: the numerical chi2 valley should track the
-inclination-corrected analytic line closely. `fig_vsys_degeneracy` is the
-deliberate contrast case -- expected to come out axis-aligned (untilted),
-confirming `VSYS` errors don't leak into `s1` under symmetric coverage.
-`fig_s1_vs_pa` is the decisive plot: if every ring nulls at the same PA
-offset, the signal is consistent with a single PA error and the detection is
-not robust; if they null at different offsets, no single PA error explains
-away the signal.
+`fig_pa_degeneracy` doubles as an acceptance test for the geometry code: the
+numerical chi2 valley should track the inclination-corrected analytic line
+closely. `fig_vsys_degeneracy` is the contrast case -- expected to come out
+axis-aligned (untilted), confirming `VSYS` errors don't leak into `s1` under
+symmetric coverage. `fig_s1_vs_pa` is the decisive plot: if every ring nulls
+at the same PA offset, the signal is consistent with a single PA error and
+the detection is not robust; if they null at different offsets, no single PA
+error explains away the signal.
 """)
 
 code(r"""
@@ -223,13 +201,12 @@ None
 md(r"""
 ## Figures 8-9: bootstrap and weighting-scheme comparison
 
-The bootstrap (block-resampled over beam-sized cells, since adjacent 4"
-pixels are not independent under the MeerKAT beam) is the quoted statistical
-error throughout this project -- the formal covariance from the fit assumes
-independent pixels, which is false here. `fig_weighting_comparison` shows
-whether `s1` is stable across `uniform`/`sin2`/`invvar`; if the schemes
-disagree by more than the bootstrap width, that disagreement is itself a
-result.
+The bootstrap interval is the quoted statistical error throughout this
+project (the formal covariance from the fit assumes independent pixels,
+which is false at 4" pixels under this beam). `fig_weighting_comparison`
+shows whether `s1` is stable across `uniform`/`sin2`/`invvar`; if the
+schemes disagree by more than the bootstrap width, that disagreement is
+itself a result.
 """)
 
 code(r"""

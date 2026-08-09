@@ -576,13 +576,12 @@ Generate it programmatically with `nbformat`. Structure:
 4. Geometry + the Section 2.3 assertion.
 5. Run the fit (this one call also produces the PA/VSYS scans and the
    bootstrap — they are bundled per ring since they share masks/weights, see
-   Section 5.9 — so there is no cheaper way to show pre-fit-only results
-   before this cell; note approximate runtime).
+   Section 5.9; note approximate runtime).
 6. Figures 1–2 (`fig_theta_map`, `fig_coverage`).
-7. Figure 3 (`fig_residual_maps`), with a markdown cell prompting explicit
+7. Display `ring_results.ecsv` as a table.
+8. Figure 3 (`fig_azimuthal_vlos`).
+9. Figure 4 (`fig_residual_maps`), with a markdown cell prompting explicit
    inspection of the pre-fit panel before trusting anything below it.
-8. Display `ring_results.ecsv` as a table.
-9. Figure 4 (`fig_azimuthal_vlos`).
 10. Figures 5–7 (`fig_pa_degeneracy`, `fig_vsys_degeneracy`, `fig_s1_vs_pa`) —
     reads the scan grids already computed in step 5, no extra computation.
 11. Figures 8–9 (`fig_bootstrap`, `fig_weighting_comparison`).
