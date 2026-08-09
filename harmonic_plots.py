@@ -127,12 +127,40 @@ def _ring_edges_arcsec(res: Results):
 # --------------------------------------------------------------------------
 
 
+def _combined_ring_map(res: Results, key: str, combine="nan_fill"):
+    """Merges a per-ring map into one full-frame array. Rings are disjoint
+    annuli, so for `key`s that are zero outside their mask (e.g. weights,
+    combine="sum") summing is exact; for `key`s that are NaN outside their
+    mask (e.g. dv_prefit/dv_postfit, combine="nan_fill") later rings simply
+    fill in the initial NaN wherever they have finite data."""
+    shape = res.maps["ring0_theta"].shape
+    if combine == "sum":
+        out = np.zeros(shape)
+        for i in range(res.n_rings):
+            out += res.maps[f"ring{i}_{key}"]
+        return out
+    out = np.full(shape, np.nan)
+    for i in range(res.n_rings):
+        arr = res.maps[f"ring{i}_{key}"]
+        m = np.isfinite(arr)
+        out[m] = arr[m]
+    return out
+
+
+def _overlay_ring_ellipses(res: Results, ax, colors="black"):
+    for i in range(res.n_rings):
+        R = res.maps[f"ring{i}_R_arcsec"]
+        row = res.row(i)
+        ax.contour(R, levels=[row["r_in_arcsec"], row["r_out_arcsec"]], colors=colors,
+                   linewidths=0.8, linestyles=":")
+
+
 def fig_theta_map(res: Results):
     theta = res.maps["ring0_theta"]
     R_arcsec = res.maps["ring0_R_arcsec"]
     edges = _ring_edges_arcsec(res)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6.5))
 
     im = ax1.imshow(np.degrees(theta) % 360, origin="lower", cmap="twilight", vmin=0, vmax=360)
     ax1.contour(np.degrees(theta) % 360, levels=[0, 90, 180, 270], colors="black", linewidths=0.8, alpha=0.6)
@@ -156,7 +184,14 @@ def fig_theta_map(res: Results):
     ax2.contour(R_arcsec, levels=edges, colors="black", linewidths=0.8, linestyles=":")
     ax2.set_title("sign(cos theta): approaching (blue) / receding (red)")
 
-    fig.suptitle(f"Convention check: theta and side definitions {res.caption_tag()}")
+    w_combined = _combined_ring_map(res, "weights_primary", combine="sum")
+    w_plot = np.where(w_combined > 0, w_combined, np.nan)
+    im3 = ax3.imshow(w_plot, origin="lower", cmap="viridis")
+    _overlay_ring_ellipses(res, ax3, colors="white")
+    fig.colorbar(im3, ax=ax3, fraction=0.046, label="w")
+    ax3.set_title(f"w(theta) inside the mask, {res.primary_weighting} weighting")
+
+    fig.suptitle(f"Convention check: theta, side, and weight definitions {res.caption_tag()}")
     fig.tight_layout()
     return fig
 
@@ -186,47 +221,36 @@ def fig_coverage(res: Results):
     return fig
 
 
-def fig_weight_map(res: Results):
-    fig, axes = plt.subplots(1, res.n_rings, figsize=(5 * res.n_rings, 5))
-    if res.n_rings == 1:
-        axes = [axes]
-    for i, ax in enumerate(axes):
-        w = res.maps[f"ring{i}_weights_primary"]
-        w_plot = np.where(w > 0, w, np.nan)
-        im = ax.imshow(w_plot, origin="lower", cmap="viridis")
-        fig.colorbar(im, ax=ax, fraction=0.046)
-        ax.set_title(f"ring {i}")
-    fig.suptitle(f"w(theta) inside the mask, primary weighting {res.caption_tag()}")
-    fig.tight_layout()
-    return fig
-
-
 # --------------------------------------------------------------------------
 # 6.2 Pre-fit
 # --------------------------------------------------------------------------
 
 
-def _residual_map_figure(res: Results, key: str, title: str):
-    edges = _ring_edges_arcsec(res)
-    fig, axes = plt.subplots(1, res.n_rings, figsize=(5 * res.n_rings, 5))
-    if res.n_rings == 1:
-        axes = [axes]
-    all_vals = np.concatenate([res.maps[f"ring{i}_{key}"][np.isfinite(res.maps[f"ring{i}_{key}"])] for i in range(res.n_rings)])
+def fig_residual_maps(res: Results):
+    """Pre-fit and post-fit residual, each as one full-frame map (all rings
+    merged, disjoint annuli) rather than split ring by ring, with the ring
+    boundaries overlaid as ellipses."""
+    pre = _combined_ring_map(res, "dv_prefit", combine="nan_fill")
+    post = _combined_ring_map(res, "dv_postfit", combine="nan_fill")
+
+    all_vals = np.concatenate([pre[np.isfinite(pre)], post[np.isfinite(post)]])
     vmax = np.nanpercentile(np.abs(all_vals), 98) if len(all_vals) else 1.0
-    for i, ax in enumerate(axes):
-        dv = res.maps[f"ring{i}_{key}"]
-        R_arcsec = res.maps[f"ring{i}_R_arcsec"]
-        im = ax.imshow(dv, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-        ax.contour(R_arcsec, levels=edges, colors="black", linewidths=0.6, linestyles=":")
-        fig.colorbar(im, ax=ax, fraction=0.046, label="km/s")
-        ax.set_title(f"ring {i}")
-    fig.suptitle(f"{title} {res.caption_tag()}")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6.5))
+
+    im1 = ax1.imshow(pre, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    _overlay_ring_ellipses(res, ax1)
+    fig.colorbar(im1, ax=ax1, fraction=0.046, label="km/s")
+    ax1.set_title("Pre-fit: dv = (mom1-VSYS)/sin(i) - VROT*cos(theta)")
+
+    im2 = ax2.imshow(post, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    _overlay_ring_ellipses(res, ax2)
+    fig.colorbar(im2, ax=ax2, fraction=0.046, label="km/s")
+    ax2.set_title("Post-fit: dv - s1*sin(theta)")
+
+    fig.suptitle(f"Residual maps, before and after the fit {res.caption_tag()}")
     fig.tight_layout()
     return fig
-
-
-def fig_prefit_residual(res: Results):
-    return _residual_map_figure(res, "dv_prefit", "Pre-fit residual dv = (mom1-VSYS)/sin(i) - VROT*cos(theta)")
 
 
 # --------------------------------------------------------------------------
@@ -312,10 +336,6 @@ def fig_azimuthal_vlos(res: Results):
 # --------------------------------------------------------------------------
 # 6.4 Post-fit and systematics
 # --------------------------------------------------------------------------
-
-
-def fig_postfit_residual(res: Results):
-    return _residual_map_figure(res, "dv_postfit", "Post-fit residual (after subtracting s1*sin(theta))")
 
 
 def _degeneracy_contour_figure(res: Results, kind: str):
@@ -484,10 +504,8 @@ def fig_vrad_profile(res: Results):
 ALL_FIGURES = [
     ("fig_theta_map", fig_theta_map),
     ("fig_coverage", fig_coverage),
-    ("fig_weight_map", fig_weight_map),
-    ("fig_prefit_residual", fig_prefit_residual),
+    ("fig_residual_maps", fig_residual_maps),
     ("fig_azimuthal_vlos", fig_azimuthal_vlos),
-    ("fig_postfit_residual", fig_postfit_residual),
     ("fig_pa_degeneracy", fig_pa_degeneracy),
     ("fig_vsys_degeneracy", fig_vsys_degeneracy),
     ("fig_s1_vs_pa", fig_s1_vs_pa),

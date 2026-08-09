@@ -478,32 +478,44 @@ weighting scheme.
 
 ### 6.1 Convention checks — look at these before trusting anything
 
-1. **`fig_theta_map`** — `theta` on a cyclic colormap (`twilight`), contours at
-   0/90/180/270°, major and minor axes drawn, an arrow and label at `theta = 0`
-   annotated "receding", ring ellipses overlaid. Beside it, a two-colour panel of
-   `sign(cos theta)` labelled approaching/receding. This is the figure that makes
-   the old bug impossible to miss; regenerate it every run.
+1. **`fig_theta_map`** — three panels, sharing one figure. (a) `theta` on a
+   cyclic colormap (`twilight`), contours at 0/90/180/270°, major and minor
+   axes drawn, an arrow and label at `theta = 0` annotated "receding", ring
+   ellipses overlaid. (b) a two-colour panel of `sign(cos theta)` labelled
+   approaching/receding. (c) `w(theta)` inside the mask, primary weighting,
+   ring ellipses overlaid — makes visible that `sin2` concentrates the
+   constraint near the minor axis and that most of the disc contributes
+   almost nothing. All three are full-frame maps (every ring merged into one
+   image, not one panel per ring — the rings are disjoint annuli on the same
+   pixel grid, so merging is exact) with the ring boundaries as ellipse
+   overlays. This is the figure that makes the old bug impossible to miss;
+   regenerate it every run.
 2. **`fig_coverage`** — per ring, a polar histogram of `sum(w)` against `theta`,
    with `L0` and `L1` printed in each panel. Tells you whether the orthogonality
-   protection actually holds for this data.
-3. **`fig_weight_map`** — `w(theta)` inside the mask. Makes visible that `sin2`
-   concentrates the constraint near the minor axis and that most of the disc
-   contributes almost nothing.
+   protection actually holds for this data. (This one stays one panel per ring,
+   unlike `fig_theta_map`'s panels — a polar histogram from a single merged ring
+   would erase exactly the per-ring `L0`/`L1` comparison the figure exists for.)
 
-### 6.2 Pre-fit
+### 6.2 Pre-fit and post-fit residual
 
-4. **`fig_prefit_residual`** — 2D map of
-   `dv = (mom1 - VSYS)/sin(inc) - VROT*cos(theta)`, diverging colormap centred
-   on zero, rings overlaid. **This is the most important diagnostic in the
-   project.** Genuine axisymmetric radial motion appears as a clean dipole
-   aligned with the minor axis. A localised blob, a one-sided feature, or
-   something tracking tidal structure means a single `s1` per ring is the wrong
-   model — and given the group environment, that possibility has to be
-   ruled out before the fit is meaningful, not after.
+3. **`fig_residual_maps`** — two panels in one figure, pre-fit and post-fit,
+   each a full-frame map (all rings merged, not split ring by ring) with ring
+   ellipses overlaid, sharing one diverging colormap centred on zero so the
+   two panels are visually comparable.
+   - **Pre-fit** (left): `dv = (mom1 - VSYS)/sin(inc) - VROT*cos(theta)`.
+     **This is the most important diagnostic in the project.** Genuine
+     axisymmetric radial motion appears as a clean dipole aligned with the
+     minor axis. A localised blob, a one-sided feature, or something tracking
+     tidal structure means a single `s1` per ring is the wrong model — and
+     given the group environment, that possibility has to be ruled out before
+     the fit is meaningful, not after.
+   - **Post-fit** (right): residual after subtracting `s1*sin(theta)`. Should
+     be structureless; any coherent pattern remaining is the argument for
+     adding `c2, s2`.
 
 ### 6.3 Data vs model, azimuthal
 
-5. **`fig_azimuthal_vlos`** — one panel per ring, `V_los` in **km/s, not
+4. **`fig_azimuthal_vlos`** — one panel per ring, `V_los` in **km/s, not
    deprojected**, against `theta`:
    - binned data points from the data mom1 (wedges of `360/n_wedge` degrees,
      `n_wedge = 24`), error bars = weighted std / sqrt(n_beams in wedge);
@@ -521,12 +533,9 @@ weighting scheme.
    Keep the old script's `theta` axis remapped to 90°–450° so the approaching
    region is contiguous, with the shaded bands and labels.
 
-### 6.4 Post-fit and systematics
+### 6.4 Systematics
 
-6. **`fig_postfit_residual`** — residual map after subtracting `s1*sin(theta)`.
-   Should be structureless; any coherent pattern is the argument for adding
-   `c2, s2`.
-7. **`fig_pa_degeneracy`** — per ring, filled `chi2(PA, s1)` contours at
+5. **`fig_pa_degeneracy`** — per ring, filled `chi2(PA, s1)` contours at
    `delta chi2 = 1, 4, 9`, with the inclination-corrected analytic degeneracy
    line `s1 = VROT * K(scheme) * (PA - PA_0)[rad]` overplotted (see Section
    5.6 for `K`). At `VROT ≈ 300` km/s and this galaxy's inclination the slope
@@ -535,20 +544,20 @@ weighting scheme.
    does not follow the inclination-corrected analytic line, something in the
    deprojection is wrong — the flat-sky line will *not* match even for
    correct code, so do not use it as the check.
-8. **`fig_vsys_degeneracy`** — same layout for `(VSYS, s1)`, presented
+6. **`fig_vsys_degeneracy`** — same layout for `(VSYS, s1)`, presented
    deliberately as the contrast case: expected to be axis-aligned.
-9. **`fig_s1_vs_pa`** — `s1` against PA offset, one line per ring, on one axis.
+7. **`fig_s1_vs_pa`** — `s1` against PA offset, one line per ring, on one axis.
    **This is the decisive plot for the paper.** If all four rings cross zero at
    the same PA offset, the signal is consistent with a single PA error and the
    detection is not robust. If they cross at different offsets, no single PA can
    null the signal and the radial motion is real. Mark Barolo's PA uncertainty as
    a shaded band if one is available.
-10. **`fig_bootstrap`** — histograms of the bootstrap `s1` per ring, with the
-    point estimate and the 16/84 percentiles marked.
-11. **`fig_weighting_comparison`** — `s1` per ring under all three schemes, side
-    by side. If the schemes disagree by more than the bootstrap width, that
-    disagreement *is* a result and belongs in the paper.
-12. **`fig_vrad_profile`** — the headline figure. **Signed** `s1(R)` against
+8. **`fig_bootstrap`** — histograms of the bootstrap `s1` per ring, with the
+   point estimate and the 16/84 percentiles marked.
+9. **`fig_weighting_comparison`** — `s1` per ring under all three schemes, side
+   by side. If the schemes disagree by more than the bootstrap width, that
+   disagreement *is* a result and belongs in the paper.
+10. **`fig_vrad_profile`** — the headline figure. **Signed** `s1(R)` against
     radius, approaching / receding / both, with statistical (bootstrap) and
     systematic (PA-scan half-width) errors drawn as distinct bars. Twin top axis
     in kpc using the ringlog-derived scale. Keep the shaded optical/HI-extent
@@ -564,14 +573,21 @@ Generate it programmatically with `nbformat`. Structure:
    the inner edge) and its consequence, the sign-convention caveat.
 2. Config cell — the one place a user edits anything.
 3. Load ringlog and maps; display the ring table and the header-derived beam.
-4. Geometry + the Section 2.3 assertion, then figures 1–3.
-5. Figure 4 (pre-fit residual), with a markdown cell prompting explicit
-   inspection before continuing.
-6. Run the fit; display `ring_results.ecsv` as a table.
-7. Figures 5–6.
-8. Scans (slowest cells; note approximate runtime), then figures 7–9.
-9. Bootstrap, then figures 10–11.
-10. Figure 12 and a closing markdown summary of the error budget.
+4. Geometry + the Section 2.3 assertion.
+5. Run the fit (this one call also produces the PA/VSYS scans and the
+   bootstrap — they are bundled per ring since they share masks/weights, see
+   Section 5.9 — so there is no cheaper way to show pre-fit-only results
+   before this cell; note approximate runtime).
+6. Figures 1–2 (`fig_theta_map`, `fig_coverage`).
+7. Figure 3 (`fig_residual_maps`), with a markdown cell prompting explicit
+   inspection of the pre-fit panel before trusting anything below it.
+8. Display `ring_results.ecsv` as a table.
+9. Figure 4 (`fig_azimuthal_vlos`).
+10. Figures 5–7 (`fig_pa_degeneracy`, `fig_vsys_degeneracy`, `fig_s1_vs_pa`) —
+    reads the scan grids already computed in step 5, no extra computation.
+11. Figures 8–9 (`fig_bootstrap`, `fig_weighting_comparison`).
+12. Figure 10 (`fig_vrad_profile`) and a closing markdown summary of the
+    error budget.
 
 Every figure appears inline. The notebook should run top to bottom on a clean
 checkout with no manual edits beyond the config cell.

@@ -136,14 +136,18 @@ results_table = hf.main(cfg)
 """)
 
 md(r"""
-## Figures 1-3: convention checks
+## Figures 1-2: convention checks
 
-Look at these before trusting anything else. `fig_theta_map` is the figure
-that makes the old sign bug impossible to miss -- regenerate it every run.
-`fig_coverage` shows whether the `L0`/`L1` orthogonality protection actually
-holds for this data's (patchy) azimuthal coverage. `fig_weight_map` makes it
-visible that `sin2` weighting concentrates the constraint near the minor
-axis.
+Look at these before trusting anything else. `fig_theta_map` is now a
+three-panel figure (theta map, sign(cos theta), and `w(theta)` inside the
+mask all sharing one figure, each a full-frame map with all rings merged --
+the rings are disjoint annuli on the same pixel grid, so merging is exact)
+-- this is the figure that makes the old sign bug impossible to miss, and
+also makes visible that `sin2` weighting concentrates the constraint near
+the minor axis. `fig_coverage` shows whether the `L0`/`L1` orthogonality
+protection actually holds for this data's (patchy) azimuthal coverage --
+this one stays one panel per ring, since a merged polar histogram would
+erase exactly the per-ring `L0`/`L1` comparison it exists for.
 """)
 
 code(r"""
@@ -151,23 +155,24 @@ res = hp.load_results(cfg.results_dir)
 
 hp.fig_theta_map(res)
 hp.fig_coverage(res)
-hp.fig_weight_map(res)
 None
 """)
 
 md(r"""
-## Figure 4: pre-fit residual -- STOP and look at this before continuing
+## Figure 3: residual maps -- STOP and look at the pre-fit panel before continuing
 
-**This is the most important diagnostic in the project.** Genuine
-axisymmetric radial motion appears as a clean dipole aligned with the minor
-axis. A localised blob, a one-sided feature, or something tracking tidal
-structure means a single `s1` per ring is the wrong model -- and given the
-group environment this target sits in, that possibility has to be ruled out
-before anything below is taken at face value.
+**The pre-fit panel is the most important diagnostic in the project.**
+Genuine axisymmetric radial motion appears as a clean dipole aligned with
+the minor axis. A localised blob, a one-sided feature, or something tracking
+tidal structure means a single `s1` per ring is the wrong model -- and given
+the group environment this target sits in, that possibility has to be ruled
+out before anything below is taken at face value. The post-fit panel (after
+subtracting `s1*sin(theta)`) should be structureless; any coherent pattern
+remaining is the argument for enabling `c2, s2`.
 """)
 
 code(r"""
-hp.fig_prefit_residual(res)
+hp.fig_residual_maps(res)
 None
 """)
 
@@ -180,24 +185,21 @@ res.table
 """)
 
 md(r"""
-## Figures 5-6: azimuthal comparison and post-fit residual
+## Figure 4: azimuthal comparison
 
 `fig_azimuthal_vlos` compares the data, the Barolo model (through the same
 wedges and mask, so it carries the same beam smearing), and the harmonic
 fit. Where data and Barolo diverge but data and the harmonic fit agree, that
-gap *is* the `s1` detection, shown directly. `fig_postfit_residual` should
-be structureless -- any coherent pattern is the argument for enabling
-`c2, s2`.
+gap *is* the `s1` detection, shown directly.
 """)
 
 code(r"""
 hp.fig_azimuthal_vlos(res)
-hp.fig_postfit_residual(res)
 None
 """)
 
 md(r"""
-## Figures 7-9: PA/VSYS degeneracy and s1 vs. PA offset
+## Figures 5-7: PA/VSYS degeneracy and s1 vs. PA offset
 
 These read the scan grids already computed in the pipeline cell above (no
 extra computation here). `fig_pa_degeneracy` doubles as an acceptance test
@@ -219,7 +221,7 @@ None
 """)
 
 md(r"""
-## Figures 10-11: bootstrap and weighting-scheme comparison
+## Figures 8-9: bootstrap and weighting-scheme comparison
 
 The bootstrap (block-resampled over beam-sized cells, since adjacent 4"
 pixels are not independent under the MeerKAT beam) is the quoted statistical
@@ -237,7 +239,7 @@ None
 """)
 
 md(r"""
-## Figure 12: V_rad(R) -- the headline result
+## Figure 10: V_rad(R) -- the headline result
 """)
 
 code(r"""
@@ -250,19 +252,19 @@ md(r"""
 
 - **Formal (covariance) errors** are reference only -- they assume
   independent pixels, false at 4" pixels under this beam. The **bootstrap**
-  interval (figure 10) is the quoted statistical error.
+  interval (figure 8) is the quoted statistical error.
 - **`L0`/`L1`** (figure 2) measure leakage from `VSYS`/`VROT` errors into
   `s1` due to asymmetric azimuthal coverage; they are the quantitative
   justification for holding `VSYS` and `VROT` fixed rather than refitting
   them per ring.
-- **PA is the one leak no weighting scheme can suppress** (figure 7): a PA
+- **PA is the one leak no weighting scheme can suppress** (figure 5): a PA
   error contributes a `sin(theta)` term, the same harmonic as the signal
-  itself. Figure 9 (`s1` vs. PA offset) is the direct test of whether the
+  itself. Figure 7 (`s1` vs. PA offset) is the direct test of whether the
   detected `s1` survives a plausible PA error, ring by ring.
-- **`VSYS` does not leak** under symmetric coverage (figure 8, by contrast
-  with figure 7) -- any tilt seen there is a direct, quantitative measurement
+- **`VSYS` does not leak** under symmetric coverage (figure 6, by contrast
+  with figure 5) -- any tilt seen there is a direct, quantitative measurement
   of this data's coverage asymmetry, not a generic property of the method.
-- **The weighting-scheme comparison** (figure 11) is a robustness check, not
+- **The weighting-scheme comparison** (figure 9) is a robustness check, not
   a precision one: `sin2` is not claimed to be optimal, only less sensitive
   to the systematics (fixed-`VROT` error, beam smearing, warp) concentrated
   on the major axis.
@@ -271,7 +273,7 @@ md(r"""
   information this pipeline does not have (dust lanes, a trailing-arm
   assumption).
 - Finally: `VROT` in this ringlog was fitted by 3D-Barolo with `VRAD` fixed
-  at zero, so holding it fixed here is formally circular. Figure 7's PA scan
+  at zero, so holding it fixed here is formally circular. Figure 5's PA scan
   is the quantitative handle on how much that circularity actually matters
   for the conclusion.
 """)
