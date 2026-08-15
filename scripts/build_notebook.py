@@ -46,6 +46,7 @@ The one cell in this notebook you are expected to edit.
 code(r"""
 %matplotlib inline
 from pathlib import Path
+import numpy as np
 import harmonic_fit as hf
 import harmonic_plots as hp
 
@@ -179,16 +180,66 @@ None
 """)
 
 md(r"""
+## The V_rad-PA degeneracy: analytic derivation
+
+A PA error `dPA` contributes a `sin(theta)` term to the residual -- the same
+harmonic as the `s1` signal itself, so no weighting scheme can suppress it
+(Section 5.6 of `CLAUDE.md`). The flat-sky approximation for this leak,
+`s1_leak = -VROT * dPA[rad]`, is **not accurate at this galaxy's
+inclination**: differentiating `make_geometry` shows a PA error does not
+shift `theta` by a uniform amount once you deproject through `cos(inc)`:
+
+```
+dtheta/d(dPA) = -(cos(theta)^2/cos(inc) + cos(inc)*sin(theta)^2)  =  g(theta)
+```
+
+which ranges from `-1/cos(inc)` on the major axis to `-cos(inc)` on the
+minor axis. Propagating this through the weighted `s1` estimator gives the
+actual leakage slope:
+
+```
+K(scheme) = sum(w * g(theta) * sin(theta)**2) / sum(w * sin(theta)**2)
+s1_leak   = VROT * dPA[rad] * K(scheme)
+```
+
+with closed forms for constant-`sigma` weighting (`ci = cos(inc)`):
+`K_uniform = -(1/ci + 3*ci)/4`, `K_sin2 = -(1/ci + 5*ci)/6`. This is the
+line overplotted on `fig_pa_degeneracy` below (via
+`harmonic_fit.pa_degeneracy_slope`, computed numerically from each ring's
+actual masked `theta`/`w`, not the closed form) -- and it is also the
+inclination-corrected acceptance test in `harmonic_fit.py --selftest`
+(test 2): if the numerical chi2 valley did not follow this line, the
+deprojection would be wrong.
+""")
+
+code(r"""
+ci = np.cos(np.radians(res.table["inc_deg"][0]))
+print(f"INC = {res.table['inc_deg'][0]:.3f} deg, cos(inc) = {ci:.4f}")
+print(f"K_uniform (closed form) = {-(1/ci + 3*ci)/4:.3f}")
+print(f"K_sin2 (closed form)    = {-(1/ci + 5*ci)/6:.3f}")
+print()
+print(f"{'ring':<6}{'VROT [km/s]':>14}{'K(sin2)':>10}{'slope [km/s/deg]':>20}")
+for i in range(res.n_rings):
+    theta = res.maps[f"ring{i}_theta"]
+    mask = res.maps[f"ring{i}_ring_mask_both"]
+    w = res.maps[f"ring{i}_weights_primary"]
+    row = res.row(i)
+    K = hf.pa_degeneracy_slope(theta[mask], w[mask], 1.0, row["inc_deg"])  # VROT=1 -> K itself
+    slope_per_deg = row["vrot_kms"] * K * np.pi / 180.0
+    print(f"{i:<6}{row['vrot_kms']:14.1f}{K:10.3f}{slope_per_deg:20.2f}")
+""")
+
+md(r"""
 ## Figures 5-7: PA/VSYS degeneracy and s1 vs. PA offset
 
 `fig_pa_degeneracy` doubles as an acceptance test for the geometry code: the
 numerical chi2 valley should track the inclination-corrected analytic line
-closely. `fig_vsys_degeneracy` is the contrast case -- expected to come out
-axis-aligned (untilted), confirming `VSYS` errors don't leak into `s1` under
-symmetric coverage. `fig_s1_vs_pa` is the decisive plot: if every ring nulls
-at the same PA offset, the signal is consistent with a single PA error and
-the detection is not robust; if they null at different offsets, no single PA
-error explains away the signal.
+(just derived above) closely. `fig_vsys_degeneracy` is the contrast case --
+expected to come out axis-aligned (untilted), confirming `VSYS` errors don't
+leak into `s1` under symmetric coverage. `fig_s1_vs_pa` is the decisive
+plot: if every ring nulls at the same PA offset, the signal is consistent
+with a single PA error and the detection is not robust; if they null at
+different offsets, no single PA error explains away the signal.
 """)
 
 code(r"""
@@ -225,6 +276,33 @@ None
 """)
 
 md(r"""
+## Interpreting the sign of s1
+
+`s1`'s sign only maps onto physical inflow/outflow given external
+information about which side of the disc is nearer the observer -- Section
+2.6 of `CLAUDE.md`. Given that information, the mapping is a short,
+checkable derivation (recorded in full in `CLAUDE.md` Section 2.6.1):
+
+`theta` increases counter-clockwise on the sky (a direct consequence of this
+project's confirmed East-left, `CDELT1 < 0` orientation -- `make_geometry`
+only ever rotates and positively stretches the pixel frame, never mirrors
+it), and `theta = 0` is receding by construction. At `theta = 90 deg` (the
+minor axis), pure rotation drops out (`cos(90 deg) = 0`), so the entire
+residual there is the radial term: `v_los - VSYS = sin(i) * s1`. The near
+side is, by definition, tilted toward the observer -- so outward motion
+there blueshifts, inward motion redshifts.
+
+**Given the near side is at `theta = +90 deg`** (consistent with the
+observed clockwise rotation on the sky -- the two aren't independent
+evidence, see `CLAUDE.md` Section 2.6.1), true outward `V_rad = -s1`. Since
+`s1` came out negative in every ring above, that resolves to **outward
+motion -- expansion, not infall** -- contingent entirely on that near-side
+determination. `near_side_assumed` in `results/ring_results.ecsv` stays
+`"UNRESOLVED"`; this is a human interpretation for the paper text, not
+something the pipeline itself asserts.
+""")
+
+md(r"""
 ## Closing summary: the error budget
 
 - **Formal (covariance) errors** are reference only -- they assume
@@ -245,10 +323,11 @@ md(r"""
   a precision one: `sin2` is not claimed to be optimal, only less sensitive
   to the systematics (fixed-`VROT` error, beam smearing, warp) concentrated
   on the major axis.
-- **The sign of `s1` is not a physical inflow/outflow claim on its own** --
-  `near_side_assumed = "UNRESOLVED"` throughout. That mapping needs external
-  information this pipeline does not have (dust lanes, a trailing-arm
-  assumption).
+- **The sign of `s1` is not a physical inflow/outflow claim from the
+  pipeline alone** -- `near_side_assumed = "UNRESOLVED"` throughout, and the
+  code never resolves it. Given the near side stated above
+  (`theta = +90 deg`), it reads as outward motion (expansion); flip the near
+  side and the reading flips too.
 - Finally: `VROT` in this ringlog was fitted by 3D-Barolo with `VRAD` fixed
   at zero, so holding it fixed here is formally circular. Figure 5's PA scan
   is the quantitative handle on how much that circularity actually matters

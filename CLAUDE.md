@@ -152,6 +152,59 @@ known**. Inclination alone is degenerate under `i -> -i`. The code must:
 - have every plot axis labelled `s1` with a footnote that the inflow/outflow
   mapping requires external information (dust lanes, trailing-arm assumption).
 
+### 2.6.1 Resolving the sign, given external near-side information
+
+The code must not resolve this (2.6) — but once a human supplies the near
+side from external information (dust lanes, trailing-arm morphology, or a
+direct statement), the sign is resolved by a short, checkable derivation,
+recorded here rather than in code, so it doesn't have to be re-derived from
+scratch (and re-risk a sign error) every time it comes up.
+
+`theta` increases **counter-clockwise on the sky image**. This follows from
+`make_geometry`'s construction: `(dx_rot, dy_rot)` is a *proper* rotation of
+the sky-pixel frame by `PA_math` (determinant +1, no mirroring), followed by
+dividing `dy_rot` by `cos(i) > 0` (a positive stretch, also no mirroring) —
+neither step flips handedness, so `theta` inherits its sense directly from
+the pixel frame. For this project's confirmed East-left/North-up
+orientation (`CDELT1 < 0`), `dx = West`, `dy = North`, and the standard
+astrometric identity `E-hat x N-hat = r-hat` (pointing *away* from the
+observer) makes `(West, North, toward-observer)` right-handed — so `theta`
+increasing is counter-clockwise as displayed. `theta = 0` is receding by
+construction (Section 2.3's assertion, an empirical fact, not an
+assumption).
+
+Evaluate the model exactly at `theta = 90 deg` (the minor axis): `cos(theta)
+= 0`, so pure rotation contributes nothing there, and the entire residual is
+the radial term: `v_los - VSYS = sin(i) * s1`. Whichever side of the minor
+axis is the *near* side (tilted toward the observer) is, at that location,
+made *closer* to the observer by outward motion and *farther* by inward
+motion — so blueshift there means outward motion, redshift means inward.
+
+Combined with `sin(i) > 0`, this gives two cases (the `i -> -i` mirror pair
+from Section 2.6):
+
+| Near side at | Rotation on sky | True outward `V_rad` |
+|---|---|---|
+| `theta = +90 deg` | clockwise | `-s1` |
+| `theta = -90 deg` (`270 deg`) | counter-clockwise | `+s1` |
+
+The two columns in each row are not independent evidence: given `theta = 0`
+is receding (always true) and `theta` increases CCW on the sky (always true
+for this project's orientation), *either one* of "near side" or "rotation
+sense" determines the other. Agreement between an independently-stated near
+side and rotation sense is a consistency check on that determination, not
+two separate pieces of evidence for it.
+
+**For this galaxy**, the project owner states the near side is at
+`theta = +90 deg` (consistent with the observed clockwise rotation on the
+sky, per the table above) — so `true outward V_rad = -s1`. Since the
+primary fit (`sin2` weighting, side=`both`) gives `s1` negative in every
+ring (approximately -7 to -48 km/s), this resolves to **outward motion —
+expansion, not infall** — contingent entirely on that near-side
+determination. `near_side_assumed` in the results file stays `"UNRESOLVED"`;
+this section documents the interpretation for the paper text, it does not
+change what the code writes.
+
 ---
 
 ## 3. Ring definitions — resolved

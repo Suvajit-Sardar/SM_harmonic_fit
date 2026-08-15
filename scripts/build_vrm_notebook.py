@@ -201,6 +201,61 @@ None
 """)
 
 md(r"""
+## How the VRM paper breaks the v_rad-PA (warp) degeneracy, vs. this project's approach
+
+Both this project and arXiv:2503.22306 are chasing the same worry -- that an
+apparent radial-motion signal could actually be an artifact of getting the
+disc's geometry slightly wrong -- but they attack it from different
+directions, worth being explicit about before reproducing Figure 8 below.
+
+**This project's approach (`harmonic_fit.py`, `harmonic_pipeline.ipynb`) is
+analytic and perturbative, for a single constant PA offset.** Holding
+`VROT` fixed at Barolo's value and fitting only `c0, s1`, a PA error `dPA`
+contributes a `sin(theta)` residual -- the same harmonic as `s1` itself.
+`CLAUDE.md` Section 5.6 derives the exact (inclination-corrected) leakage
+slope `K(scheme)` in closed form by differentiating `make_geometry`, so
+`s1_leak = VROT * K(scheme) * dPA[rad]` is known analytically, not just
+simulated. `fig_pa_degeneracy` and `fig_s1_vs_pa` then scan `dPA` as a
+single global number (appropriate here, since this ringlog's `P.A.` and
+`INC` are constant across all four rings -- there is no warp to speak of)
+and ask: does a plausible constant PA error alone reproduce the observed
+`s1`? This needs no synthetic data and works fine on this dataset's ~440
+pixels, because it's a closed-form sensitivity calculation, not a
+statistical comparison between two noisy reconstructions.
+
+**The VRM paper's approach (Sect. 3 of arXiv:2503.22306) is numerical and
+built for a general, radially-varying warp.** It fits `v_t` *and* `v_r`
+together with nothing held fixed but the (constant) global geometry, so it
+has no equivalent of holding `VROT` fixed and no closed-form leakage
+formula. Instead: run the TRM (allowing `i(R)`, `P.A.(R)` to vary per ring)
+to get a candidate warp geometry; build a synthetic LOS velocity map from
+*that* geometry assuming pure circular rotation (`v_r=0`); run the same
+flat-disc-assuming VRMA on both the real data and the synthetic map; compare
+the resulting `r_vtvr(R,theta)` rank-correlation maps. Their finding is that
+a genuine warp, mis-analyzed by a method that assumes a flat disc, imprints
+a specific `sin(2*theta)` dipole correlation shared between the `v_t` and
+`v_r` artifacts -- so if the real galaxy's correlation map matches the toy
+model's (Spearman `C > 0.2`, their Table 1 threshold), the signal is at
+least partly a warp; if it doesn't, that is evidence for a genuine
+intrinsic (non-warp) perturbation.
+
+**Where they meet.** Our `K(scheme)` is, in effect, the linearized special
+case of their general test, restricted to the one warp mode this galaxy's
+own ringlog actually allows (a constant PA/INC error, not a radially-varying
+one -- consistent with `P.A.`, `INC` being flat across rings in this
+ringlog). The Figure 8 reproduction below reuses their machinery, but
+because there is no warp in this ringlog to begin with, the toy model here
+is deliberately a **no-warp control** (Barolo's own pure-circular-rotation
+model map) rather than a warp hypothesis -- so `C_warp` below is asking
+"does the VRMA method itself imprint a spurious dipole correlation on data
+this sparse, even with no real warp present", a different (also useful)
+question from `harmonic_fit.py`'s "could a constant PA error explain the
+detected `s1`". Agreement between the two projects' PA/geometry
+sensitivity checks (neither finds a single simple geometry error that
+explains away the signal) is two independent methods pointing the same way.
+""")
+
+md(r"""
 ## Figure 8 reproduction: v_t, v_r, and their rank-correlation map, vs. a toy null model
 
 Reproduces Figure 8 of Sylos Labini, De Marzo & Straccamore (2025), ApJ 988,
