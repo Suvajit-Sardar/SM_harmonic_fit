@@ -85,6 +85,18 @@ def _cell_indices(R_arcsec, theta_rad, number_rings, number_arch):
     return cells
 
 
+def _cell_index_per_point(cells, n_points_total):
+    """Inverse of _cell_indices: for each point (in the same order as the
+    masked arrays used to build `cells`), the flat cell index k it falls
+    in (matching the row order of run_vrm's table), or -1 if it falls in
+    none (possible at a bin boundary -- see VRM_VRMA.py's own edge
+    convention in vrm/README.md)."""
+    idx = np.full(n_points_total, -1, dtype=int)
+    for k, (_, _, in_bin) in enumerate(cells):
+        idx[in_bin] = k
+    return idx
+
+
 def build_vreal(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_artifact_floor_kms, mom1_source=None):
     """Builds the (xp, yp, Vlos) array VRM expects. Vlos defaults to the RAW
     (not VSYS-subtracted) data mom1 -- VRM determines its own v_sys
@@ -120,6 +132,7 @@ def run_vrm(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_artifact_floor_k
     R_arcsec_full, theta_rad_full = physical_R_theta_arcsec(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign)
     R_arcsec, theta_rad = R_arcsec_full[mask], theta_rad_full[mask]
     cells = _cell_indices(R_arcsec, theta_rad, number_rings, number_arch)
+    cell_index = _cell_index_per_point(cells, len(R_arcsec))
 
     rows = []
     for k, (ring_idx, arc_idx, in_bin) in enumerate(cells):
@@ -134,7 +147,15 @@ def run_vrm(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_artifact_floor_k
             v_r=float(v_r[k]),
         ))
 
-    return dict(table=Table(rows=rows), vsys_fit=vsys_fit, n_good_pixels=int(mask.sum()), mask=mask)
+    # Per-pixel (not per-cell-mean) plane-of-the-galaxy coordinates, and
+    # which table row (cell) each pixel belongs to -- for plotting an actual
+    # map (every pixel shown at its own position, colored by its cell's
+    # fitted value) instead of one point per cell at the cell's mean position.
+    x_arcsec = R_arcsec * np.cos(theta_rad)
+    y_arcsec = R_arcsec * np.sin(theta_rad)
+
+    return dict(table=Table(rows=rows), vsys_fit=vsys_fit, n_good_pixels=int(mask.sum()), mask=mask,
+                x_arcsec=x_arcsec, y_arcsec=y_arcsec, cell_index=cell_index)
 
 
 def bin_mean_field(values_full, mask, cells):
@@ -284,4 +305,11 @@ def run_figure8_analysis(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_art
         C_sigma_vt=C_sigma_vt,
         C_sigma_vr=C_sigma_vr,
         C_warp=C_warp,
+        # Per-pixel plane-of-the-galaxy coordinates and each pixel's cell
+        # index (same for data and toy branches: same mask, same geometry,
+        # same cells -- only the fitted values differ) -- for plotting an
+        # actual map instead of one point per cell at its mean position.
+        x_arcsec=data_result["x_arcsec"],
+        y_arcsec=data_result["y_arcsec"],
+        cell_index=data_result["cell_index"],
     )
