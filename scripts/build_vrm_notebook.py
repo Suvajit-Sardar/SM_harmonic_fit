@@ -189,6 +189,131 @@ None
 """)
 
 md(r"""
+## Figure 8 reproduction: v_t, v_r, and their rank-correlation map, vs. a toy null model
+
+Reproduces Figure 8 of Sylos Labini, De Marzo & Straccamore (2025), ApJ 988,
+122, doi:10.3847/1538-4357/adc71c -- their warp/radial-flow diagnostic, built
+from: the VRMA-reconstructed `v_t(R,theta)` and `v_r(R,theta)` for this
+galaxy; the same for a toy/null model; the rank (Spearman) correlation
+coefficient map between `v_t` and `v_r`, for both; the observed velocity
+dispersion `sigma(R,theta)`; and its rank-correlation with `v_t` and `v_r`.
+A tenth panel (not in the paper) adds the LOS residual, at your request.
+
+**Two interpretive choices, documented in `vrm/README.md`:**
+
+1. **The toy model is Barolo's own model map.** The paper's toy model is
+   pure circular rotation built from the TRM's `i(R)`, `phi0(R)`, `v_c(R)`,
+   with `v_r=0`. This ringlog has **no warp** (`P.A.`, `INC` constant across
+   all four rings) and `VRAD` fixed at 0 -- which means `_local_1mom.fits`
+   (Barolo's own model map, already loaded as `mapset.model_mom1`) *is*
+   exactly that toy model, generated independently by BBarolo. Rather than
+   resynthesize a duplicate, this reuses it directly: same mask, same
+   geometry, run through the identical VRMA pipeline.
+2. **The correlation "map."** The paper's Eq. 2 sums a per-cell term (Eq. 3)
+   over *all* cells to give a single scalar; the text and the Figure 8
+   caption both call the plotted quantity a spatial "map" `r_fg(R,theta)`
+   without giving a separate formula for it. The map used below is that
+   per-cell term itself (Spearman version: standardized ranks, not raw
+   values) -- the only quantity in the paper's own equations that varies by
+   position *and* whose sum, divided by `N_cells - 1`, reproduces Eq. 2's
+   scalar exactly.
+
+**Resolution:** the paper's fiducial grid is `Nr=50, Na=32` on THINGS data
+(thousands of pixels per galaxy). This dataset has ~440 good pixels *total*
+-- `Nr=4, Na=4` (matching the VRMA demo above) is already only ~20-30
+points/cell in the best rings. Cells with fewer than 3 points (the minimum
+for a determined 2-parameter fit) are excluded from every quantity below,
+not just greyed out, since `VRM._matrix()` returns exactly `0.0` for an
+empty cell -- a real number that would otherwise silently corrupt the
+correlation maps and the residual.
+""")
+
+code(r"""
+from vrm.bridge import run_figure8_analysis
+
+fig8 = run_figure8_analysis(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_artifact_floor_kms,
+                             number_rings=4, number_arch=4)
+
+n_usable = int(np.sum(np.asarray(fig8["table"]["n_points"]) >= 3))
+n_cells = len(fig8["table"])
+
+print(f"VRM-fit VSYS: data = {fig8['vsys_fit']:.2f} km/s, toy model = {fig8['vsys_fit_toy']:.2f} km/s "
+      f"(Barolo ringlog VSYS = {vsys_barolo:.2f} km/s)")
+print(f"{n_usable} / {n_cells} cells usable (>= 3 points)")
+print(f"Overall Spearman C(r_vtvr data, r_vtvr toy) = {fig8['C_warp']:.2f}  "
+      f"(paper's threshold: |C| > 0.2 suggests a warp signature -- but with only "
+      f"{n_usable} usable cells here, versus the paper's Nr=50 x Na=32 = 1600, "
+      f"treat this as exploratory, not a firm detection)")
+print(f"C(sigma, v_t) = {fig8['C_sigma_vt']:.2f}, C(sigma, v_r) = {fig8['C_sigma_vr']:.2f}")
+
+fig8["table"]["ring_index", "arc_index", "n_points", "v_t", "v_r", "v_t_tm", "v_r_tm", "sigma_mean", "residual"]
+""")
+
+code(r"""
+def _polar_panel(ax, t, field, cmap, vlim, title, cbar_label):
+    n = np.asarray(t["n_points"])
+    reliable = n >= 3
+    vals = np.asarray(t[field])
+    ax.scatter(np.asarray(t["theta_mean"])[~reliable & np.isfinite(vals)],
+               np.asarray(t["r_arcsec_mean"])[~reliable & np.isfinite(vals)],
+               s=20, c="lightgray", edgecolor="black", linewidth=0.4, zorder=2)
+    sc = ax.scatter(np.asarray(t["theta_mean"])[reliable], np.asarray(t["r_arcsec_mean"])[reliable],
+                     c=vals[reliable], s=25 + 5 * n[reliable], cmap=cmap,
+                     vmin=vlim[0], vmax=vlim[1], edgecolor="black", zorder=3)
+    ax.set_title(title, fontsize=12)
+    ax.set_xticklabels([])
+    plt.colorbar(sc, ax=ax, fraction=0.045, pad=0.1, label=cbar_label)
+    return sc
+
+
+t = fig8["table"]
+v_t_all = np.concatenate([np.asarray(t["v_t"]), np.asarray(t["v_t_tm"])])
+v_t_lim = (np.nanmin(v_t_all), np.nanmax(v_t_all))
+v_r_lim_abs = np.nanmax(np.abs(np.concatenate([np.asarray(t["v_r"]), np.asarray(t["v_r_tm"])])))
+r_lim_abs = np.nanmax(np.abs(np.concatenate([
+    np.asarray(t["r_vtvr"]), np.asarray(t["r_vtvr_tm"]), np.asarray(t["r_sigma_vt"]), np.asarray(t["r_sigma_vr"]),
+])))
+sigma_lim = (0, np.nanmax(np.asarray(t["sigma_mean"])))
+
+fig, axes = plt.subplots(3, 3, figsize=(15, 16), subplot_kw=dict(projection="polar"))
+
+_polar_panel(axes[0, 0], t, "v_t", "viridis", v_t_lim, "(a) $v_t(R,\\theta)$ -- data", "km/s")
+_polar_panel(axes[0, 1], t, "v_r", "RdBu_r", (-v_r_lim_abs, v_r_lim_abs), "(b) $v_r(R,\\theta)$ -- data", "km/s")
+_polar_panel(axes[0, 2], t, "r_vtvr", "RdBu_r", (-r_lim_abs, r_lim_abs), "(c) $r_{v_rv_t}(R,\\theta)$ -- data", "")
+
+_polar_panel(axes[1, 0], t, "v_t_tm", "viridis", v_t_lim, "(d) $v_t^{tm}(R,\\theta)$ -- toy model", "km/s")
+_polar_panel(axes[1, 1], t, "v_r_tm", "RdBu_r", (-v_r_lim_abs, v_r_lim_abs), "(e) $v_r^{tm}(R,\\theta)$ -- toy model", "km/s")
+_polar_panel(axes[1, 2], t, "r_vtvr_tm", "RdBu_r", (-r_lim_abs, r_lim_abs), "(f) $r^{tm}_{v_rv_t}(R,\\theta)$ -- toy model", "")
+
+_polar_panel(axes[2, 0], t, "sigma_mean", "magma", sigma_lim, "(g) $\\sigma(R,\\theta)$ -- data", "km/s")
+_polar_panel(axes[2, 1], t, "r_sigma_vt", "RdBu_r", (-r_lim_abs, r_lim_abs), "(h) $r_{\\sigma v_t}(R,\\theta)$", "")
+_polar_panel(axes[2, 2], t, "r_sigma_vr", "RdBu_r", (-r_lim_abs, r_lim_abs), "(i) $r_{\\sigma v_r}(R,\\theta)$", "")
+
+fig.suptitle("Figure 8 reproduction (Sylos Labini, De Marzo & Straccamore 2025)", fontsize=16, y=0.995)
+fig.tight_layout()
+None
+""")
+
+md(r"""
+### Added panel: LOS residual (not in the paper)
+
+Observed `v_los` minus the VRMA-reconstructed `v_los` (each cell's own
+fitted `v_t`, `v_r` run back through Eq. 1), binned the same way as every
+panel above -- the same diagnostic role as `fig_residual_maps`'s post-fit
+panel elsewhere in this project, here for the VRM fit rather than the
+harmonic fit.
+""")
+
+code(r"""
+resid_lim = np.nanmax(np.abs(np.asarray(t["residual"])))
+
+fig, ax = plt.subplots(figsize=(6.5, 6.5), subplot_kw=dict(projection="polar"))
+_polar_panel(ax, t, "residual", "RdBu_r", (-resid_lim, resid_lim), "LOS residual (data - VRMA reconstruction)", "km/s")
+fig.tight_layout()
+None
+""")
+
+md(r"""
 ## Summary
 
 - VRM's independently-fit systemic velocity and this project's Barolo-ringlog
@@ -210,6 +335,12 @@ md(r"""
   method returns a number even from an empty or near-empty bin (see
   `vrm/README.md`), and this dataset's coverage is patchy enough that this
   happens often once arcs are introduced.
+- The Figure 8 reproduction's `C_warp` is a much noisier version of the same
+  idea as Table 1 in Sylos Labini, De Marzo & Straccamore (2025): a large
+  `|C|` between the data's and the toy model's `r_vtvr(R,theta)` maps points
+  at a warp rather than intrinsic radial motion. With only a handful of
+  usable cells at this dataset's resolution, read it as a rough, exploratory
+  signal, not a resolved warp/no-warp verdict.
 """)
 
 nb["cells"] = cells
