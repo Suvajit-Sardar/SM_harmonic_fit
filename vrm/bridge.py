@@ -97,6 +97,29 @@ def _cell_index_per_point(cells, n_points_total):
     return idx
 
 
+def cell_field_to_full_frame(shape, mask, cell_index, values_per_cell, n_points_per_cell=None, min_points=None):
+    """Scatters a per-cell field (e.g. a column of run_vrm's/
+    run_figure8_analysis's table) back into a full `shape` array (NaN
+    outside good pixels), one value per pixel via `cell_index` -- so it can
+    be plotted with imshow exactly like harmonic_plots.py plots
+    data_mom1/model_mom1/dv_prefit, instead of a scatter in some other
+    coordinate system. Pass `n_points_per_cell` and `min_points` to also NaN
+    out pixels belonging to an under-constrained cell."""
+    values_per_cell = np.asarray(values_per_cell, dtype=float)
+    in_cell = cell_index >= 0
+    pixel_vals = np.full(cell_index.shape, np.nan)
+    pixel_vals[in_cell] = values_per_cell[cell_index[in_cell]]
+
+    if min_points is not None:
+        n_points_per_cell = np.asarray(n_points_per_cell)
+        low_n = in_cell & (n_points_per_cell[np.clip(cell_index, 0, None)] < min_points)
+        pixel_vals[low_n] = np.nan
+
+    full = np.full(shape, np.nan)
+    full[mask] = pixel_vals
+    return full
+
+
 def build_vreal(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_artifact_floor_kms, mom1_source=None):
     """Builds the (xp, yp, Vlos) array VRM expects. Vlos defaults to the RAW
     (not VSYS-subtracted) data mom1 -- VRM determines its own v_sys
@@ -300,6 +323,7 @@ def run_figure8_analysis(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_art
         vsys_fit=data_result["vsys_fit"],
         vsys_fit_toy=toy_result["vsys_fit"],
         n_good_pixels=data_result["n_good_pixels"],
+        mask=mask,
         C_vtvr_data=C_data,
         C_vtvr_toy=C_toy,
         C_sigma_vt=C_sigma_vt,

@@ -51,7 +51,7 @@ from astropy.table import Table
 
 import harmonic_fit as hf
 from harmonic_plots import custom_rcparams
-from vrm.bridge import run_vrm
+from vrm.bridge import run_vrm, cell_field_to_full_frame
 
 mpl.rcParams.update(custom_rcparams)
 project_dir = Path.cwd()
@@ -153,8 +153,9 @@ Splitting each ring into arcs trades points-per-bin for angular resolution.
 Given how patchy this data's azimuthal coverage already is at the per-ring
 level (see `fig_coverage` in `harmonic_pipeline.ipynb`), most bins at even
 modest resolution end up under-constrained -- shown explicitly via
-`n_points` rather than smoothed over. Bins with fewer than 3 points (an
-under- or exactly-determined 2-parameter fit) are greyed out.
+`n_points` (printed below) rather than smoothed over. Pixels in a bin with
+fewer than 3 points (an under- or exactly-determined 2-parameter fit) are
+left blank rather than colored by an unreliable estimate.
 """)
 
 code(r"""
@@ -170,33 +171,26 @@ t2["ring_index", "arc_index", "r_arcsec_mean", "n_points", "v_t", "v_r"]
 """)
 
 code(r"""
+# Same map convention as harmonic_plots.py (fig_theta_map, fig_residual_maps,
+# etc.): a full-frame array in the original pixel grid, NaN outside good
+# pixels, shown with imshow -- not a scatter in some other coordinate
+# system. Ring edge contours use this project's own Barolo ring boundaries
+# as a familiar visual anchor, even though VRM's own rings (rescaled radius)
+# don't line up with them exactly.
+_R_arcsec_grid = hf.make_geometry(mapset.shape, xc, yc, pa_deg, inc_deg, cdelt1_sign)[0] * mapset.pixscale_arcsec
+_ring_edges_arcsec = sorted(set(ringlog["r_in_arcsec"]).union(ringlog["r_out_arcsec"]))
+
+
 def _map_panel(ax, result, field, cmap, vlim, title, cbar_label, min_points=3):
-    # A *map*: every good pixel plotted at its own (x, y) in the deprojected
-    # plane of the galaxy (x = R*cos(theta), y = R*sin(theta)), colored by
-    # its VRMA cell's fitted value -- not one point per cell at the cell's
-    # mean position. Pixels whose cell has fewer than `min_points` points
-    # are shown in gray rather than colored by an unreliable estimate.
     t = result["table"]
-    x, y = result["x_arcsec"], result["y_arcsec"]
-    cell_index = result["cell_index"]
-    n_points = np.asarray(t["n_points"])
-    vals_per_cell = np.asarray(t[field], dtype=float)
-
-    in_cell = cell_index >= 0
-    idx = np.clip(cell_index, 0, None)
-    pixel_vals = np.where(in_cell, vals_per_cell[idx], np.nan)
-    reliable = in_cell & (n_points[idx] >= min_points) & np.isfinite(pixel_vals)
-
-    ax.scatter(x[in_cell & ~reliable], y[in_cell & ~reliable],
-               s=10, c="lightgray", edgecolor="none", zorder=2)
-    sc = ax.scatter(x[reliable], y[reliable], c=pixel_vals[reliable],
-                     cmap=cmap, vmin=vlim[0], vmax=vlim[1], s=18, edgecolor="none", zorder=3)
+    full = cell_field_to_full_frame(mapset.shape, result["mask"], result["cell_index"],
+                                     np.asarray(t[field], dtype=float),
+                                     n_points_per_cell=np.asarray(t["n_points"]), min_points=min_points)
+    im = ax.imshow(full, origin="lower", cmap=cmap, vmin=vlim[0], vmax=vlim[1])
+    ax.contour(_R_arcsec_grid, levels=_ring_edges_arcsec, colors="black", linewidths=0.6, linestyles=":")
     ax.set_title(title, fontsize=12)
-    ax.set_xlabel("x [arcsec]")
-    ax.set_ylabel("y [arcsec]")
-    ax.set_aspect("equal")
-    plt.colorbar(sc, ax=ax, fraction=0.045, pad=0.06, label=cbar_label)
-    return sc
+    plt.colorbar(im, ax=ax, fraction=0.045, pad=0.06, label=cbar_label)
+    return im
 
 
 fig, ax = plt.subplots(figsize=(7.5, 7.5))
