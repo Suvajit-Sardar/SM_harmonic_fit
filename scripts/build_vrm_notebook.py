@@ -170,20 +170,28 @@ t2["ring_index", "arc_index", "r_arcsec_mean", "n_points", "v_t", "v_r"]
 """)
 
 code(r"""
+# Maps in this paper are plotted in the (deprojected) plane of the galaxy,
+# i.e. Cartesian x = R*cos(theta), y = R*sin(theta) -- a face-on view -- not
+# on polar axes.
+x2 = np.asarray(t2["r_arcsec_mean"]) * np.cos(np.asarray(t2["theta_mean"]))
+y2 = np.asarray(t2["r_arcsec_mean"]) * np.sin(np.asarray(t2["theta_mean"]))
 reliable = np.asarray(t2["n_points"]) >= 3
 marginal = (np.asarray(t2["n_points"]) > 0) & ~reliable
 
-fig, ax = plt.subplots(figsize=(7.5, 7.5), subplot_kw=dict(projection="polar"))
+fig, ax = plt.subplots(figsize=(7.5, 7.5))
 
-ax.scatter(t2["theta_mean"][marginal], t2["r_arcsec_mean"][marginal],
+ax.scatter(x2[marginal], y2[marginal],
            s=30, c="lightgray", edgecolor="black", linewidth=0.5, zorder=2, label="< 3 points")
-sc = ax.scatter(t2["theta_mean"][reliable], t2["r_arcsec_mean"][reliable],
+sc = ax.scatter(x2[reliable], y2[reliable],
                  c=t2["v_r"][reliable], s=40 + 8 * t2["n_points"][reliable],
                  cmap="RdBu_r", vmin=-100, vmax=100, edgecolor="black", zorder=3)
 
-fig.colorbar(sc, ax=ax, label=r"$v_r$ [km s$^{-1}$]", pad=0.1)
-ax.legend(loc="lower left", bbox_to_anchor=(-0.15, -0.1), fontsize=10)
-ax.set_title("VRMA $v_r(R,\\theta)$, $N_r=4$, $N_a=4$", pad=20)
+fig.colorbar(sc, ax=ax, label=r"$v_r$ [km s$^{-1}$]")
+ax.legend(loc="lower left", fontsize=10)
+ax.set_xlabel("x [arcsec] (plane of the galaxy)")
+ax.set_ylabel("y [arcsec] (plane of the galaxy)")
+ax.set_aspect("equal")
+ax.set_title("VRMA $v_r(R,\\theta)$, $N_r=4$, $N_a=4$")
 fig.tight_layout()
 None
 """)
@@ -250,19 +258,25 @@ fig8["table"]["ring_index", "arc_index", "n_points", "v_t", "v_r", "v_t_tm", "v_
 """)
 
 code(r"""
-def _polar_panel(ax, t, field, cmap, vlim, title, cbar_label):
+def _map_panel(ax, t, field, cmap, vlim, title, cbar_label):
+    # Maps in this paper are plotted in the (deprojected) plane of the
+    # galaxy -- Cartesian x = R*cos(theta), y = R*sin(theta), a face-on view
+    # -- not on polar axes.
+    x = np.asarray(t["r_arcsec_mean"]) * np.cos(np.asarray(t["theta_mean"]))
+    y = np.asarray(t["r_arcsec_mean"]) * np.sin(np.asarray(t["theta_mean"]))
     n = np.asarray(t["n_points"])
     reliable = n >= 3
     vals = np.asarray(t[field])
-    ax.scatter(np.asarray(t["theta_mean"])[~reliable & np.isfinite(vals)],
-               np.asarray(t["r_arcsec_mean"])[~reliable & np.isfinite(vals)],
+    ax.scatter(x[~reliable & np.isfinite(vals)], y[~reliable & np.isfinite(vals)],
                s=20, c="lightgray", edgecolor="black", linewidth=0.4, zorder=2)
-    sc = ax.scatter(np.asarray(t["theta_mean"])[reliable], np.asarray(t["r_arcsec_mean"])[reliable],
+    sc = ax.scatter(x[reliable], y[reliable],
                      c=vals[reliable], s=25 + 5 * n[reliable], cmap=cmap,
                      vmin=vlim[0], vmax=vlim[1], edgecolor="black", zorder=3)
     ax.set_title(title, fontsize=12)
-    ax.set_xticklabels([])
-    plt.colorbar(sc, ax=ax, fraction=0.045, pad=0.1, label=cbar_label)
+    ax.set_xlabel("x [arcsec]")
+    ax.set_ylabel("y [arcsec]")
+    ax.set_aspect("equal")
+    plt.colorbar(sc, ax=ax, fraction=0.045, pad=0.06, label=cbar_label)
     return sc
 
 
@@ -275,19 +289,19 @@ r_lim_abs = np.nanmax(np.abs(np.concatenate([
 ])))
 sigma_lim = (0, np.nanmax(np.asarray(t["sigma_mean"])))
 
-fig, axes = plt.subplots(3, 3, figsize=(15, 16), subplot_kw=dict(projection="polar"))
+fig, axes = plt.subplots(3, 3, figsize=(15, 16))
 
-_polar_panel(axes[0, 0], t, "v_t", "viridis", v_t_lim, "(a) $v_t(R,\\theta)$ -- data", "km/s")
-_polar_panel(axes[0, 1], t, "v_r", "RdBu_r", (-v_r_lim_abs, v_r_lim_abs), "(b) $v_r(R,\\theta)$ -- data", "km/s")
-_polar_panel(axes[0, 2], t, "r_vtvr", "RdBu_r", (-r_lim_abs, r_lim_abs), "(c) $r_{v_rv_t}(R,\\theta)$ -- data", "")
+_map_panel(axes[0, 0], t, "v_t", "viridis", v_t_lim, "(a) $v_t(R,\\theta)$ -- data", "km/s")
+_map_panel(axes[0, 1], t, "v_r", "RdBu_r", (-v_r_lim_abs, v_r_lim_abs), "(b) $v_r(R,\\theta)$ -- data", "km/s")
+_map_panel(axes[0, 2], t, "r_vtvr", "RdBu_r", (-r_lim_abs, r_lim_abs), "(c) $r_{v_rv_t}(R,\\theta)$ -- data", "")
 
-_polar_panel(axes[1, 0], t, "v_t_tm", "viridis", v_t_lim, "(d) $v_t^{tm}(R,\\theta)$ -- toy model", "km/s")
-_polar_panel(axes[1, 1], t, "v_r_tm", "RdBu_r", (-v_r_lim_abs, v_r_lim_abs), "(e) $v_r^{tm}(R,\\theta)$ -- toy model", "km/s")
-_polar_panel(axes[1, 2], t, "r_vtvr_tm", "RdBu_r", (-r_lim_abs, r_lim_abs), "(f) $r^{tm}_{v_rv_t}(R,\\theta)$ -- toy model", "")
+_map_panel(axes[1, 0], t, "v_t_tm", "viridis", v_t_lim, "(d) $v_t^{tm}(R,\\theta)$ -- toy model", "km/s")
+_map_panel(axes[1, 1], t, "v_r_tm", "RdBu_r", (-v_r_lim_abs, v_r_lim_abs), "(e) $v_r^{tm}(R,\\theta)$ -- toy model", "km/s")
+_map_panel(axes[1, 2], t, "r_vtvr_tm", "RdBu_r", (-r_lim_abs, r_lim_abs), "(f) $r^{tm}_{v_rv_t}(R,\\theta)$ -- toy model", "")
 
-_polar_panel(axes[2, 0], t, "sigma_mean", "magma", sigma_lim, "(g) $\\sigma(R,\\theta)$ -- data", "km/s")
-_polar_panel(axes[2, 1], t, "r_sigma_vt", "RdBu_r", (-r_lim_abs, r_lim_abs), "(h) $r_{\\sigma v_t}(R,\\theta)$", "")
-_polar_panel(axes[2, 2], t, "r_sigma_vr", "RdBu_r", (-r_lim_abs, r_lim_abs), "(i) $r_{\\sigma v_r}(R,\\theta)$", "")
+_map_panel(axes[2, 0], t, "sigma_mean", "magma", sigma_lim, "(g) $\\sigma(R,\\theta)$ -- data", "km/s")
+_map_panel(axes[2, 1], t, "r_sigma_vt", "RdBu_r", (-r_lim_abs, r_lim_abs), "(h) $r_{\\sigma v_t}(R,\\theta)$", "")
+_map_panel(axes[2, 2], t, "r_sigma_vr", "RdBu_r", (-r_lim_abs, r_lim_abs), "(i) $r_{\\sigma v_r}(R,\\theta)$", "")
 
 fig.suptitle("Figure 8 reproduction (Sylos Labini, De Marzo & Straccamore 2025)", fontsize=16, y=0.995)
 fig.tight_layout()
@@ -307,8 +321,8 @@ harmonic fit.
 code(r"""
 resid_lim = np.nanmax(np.abs(np.asarray(t["residual"])))
 
-fig, ax = plt.subplots(figsize=(6.5, 6.5), subplot_kw=dict(projection="polar"))
-_polar_panel(ax, t, "residual", "RdBu_r", (-resid_lim, resid_lim), "LOS residual (data - VRMA reconstruction)", "km/s")
+fig, ax = plt.subplots(figsize=(6.5, 6.5))
+_map_panel(ax, t, "residual", "RdBu_r", (-resid_lim, resid_lim), "LOS residual (data - VRMA reconstruction)", "km/s")
 fig.tight_layout()
 None
 """)
