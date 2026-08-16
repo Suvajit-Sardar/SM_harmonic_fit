@@ -35,6 +35,12 @@ from astropy.table import Table
 
 @dataclass
 class Config:
+    # project_dir is the TRM model directory being processed (e.g.
+    # TRM_paper/, fixed_PA42/, or any new model directory the user adds) --
+    # not the repo root. Each TRM model is self-contained: maps_dir and
+    # ringlog_path live under it, and results_dir defaults to a "results"
+    # subdirectory of it, so multiple models' outputs never collide. See
+    # find_ringlog() / discover_trm_models() and the --trm-dir CLI flag.
     project_dir: Path
     maps_dir: Path
     ringlog_path: Path
@@ -91,6 +97,67 @@ def design_matrix(theta: np.ndarray, terms: Sequence[str]) -> np.ndarray:
 # --------------------------------------------------------------------------
 # 5.2 I/O
 # --------------------------------------------------------------------------
+
+
+REQUIRED_RINGLOG_COLUMNS = ("RAD(Kpc)", "RAD(arcs)", "VROT(km/s)", "E_VROT1", "E_VROT2")
+
+
+def find_ringlog(trm_dir: Path) -> Path:
+    """Locate the ringlog file inside a TRM model directory.
+
+    Each TRM model (e.g. ``TRM_paper/``, ``fixed_PA42/``, or any new model
+    directory the user adds) is self-contained: a ``maps/`` subdirectory plus
+    one whitespace-delimited, '#'-commented-header ``.txt`` ringlog. The
+    ringlog's filename is not fixed (``stage_1_opt_parameters.txt``,
+    ``PA_fixed_to_42.txt`` are both seen in practice), so it is identified by
+    its columns rather than its name. This also rejects BBarolo's
+    ``*_initial.txt`` files (initial guesses only -- no ``RAD(Kpc)`` or
+    ``E_VROT1/2`` columns, i.e. no fitted values), and any other stray
+    ``.txt`` file (stats dumps, etc.) that might sit alongside it.
+    """
+    trm_dir = Path(trm_dir)
+    candidates = []
+    for f in sorted(trm_dir.glob("*.txt")):
+        try:
+            with open(f) as fh:
+                header_line = fh.readline()
+        except OSError:
+            continue
+        if not header_line.lstrip().startswith("#"):
+            continue
+        tokens = header_line.lstrip("#").split()
+        if all(col in tokens for col in REQUIRED_RINGLOG_COLUMNS):
+            candidates.append(f)
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise RuntimeError(
+            f"No ringlog file found in {trm_dir} -- expected a whitespace-delimited, "
+            f"'#'-commented-header .txt file with columns including {REQUIRED_RINGLOG_COLUMNS}. "
+            "Pass --ringlog explicitly if the file uses different column names."
+        )
+    raise RuntimeError(
+        f"Multiple candidate ringlog files found in {trm_dir}: {candidates}. "
+        "Pass --ringlog explicitly to disambiguate."
+    )
+
+
+def discover_trm_models(root_dir: Path) -> dict:
+    """Find TRM model directories under root_dir: any immediate subdirectory
+    containing a maps/ folder and a ringlog findable by find_ringlog. Returns
+    {name: path}, sorted by name. Used by --list-trm-models and to let the
+    notebook config cell enumerate what's available without hardcoding names."""
+    root_dir = Path(root_dir)
+    models = {}
+    for d in sorted(p for p in root_dir.iterdir() if p.is_dir()):
+        if not (d / "maps").is_dir():
+            continue
+        try:
+            find_ringlog(d)
+        except RuntimeError:
+            continue
+        models[d.name] = d
+    return models
 
 
 def read_ringlog(path: Path) -> Table:
@@ -443,20 +510,44 @@ def block_bootstrap_s1(
     d, theta_rad, sigma_kms, cell_id, scheme, sigma_floor_kms, terms, n_bootstrap, rng
 ):
     """Resample beam-sized cells with replacement, concatenate their pixels,
-    refit. Returns array of bootstrap s1 draws, plus n_cells."""
+    refit. Returns array of bootstrap s1 draws, plus n_cells.
+
+    A draw can be degenerate (rank-deficient design matrix, e.g. when a
+    small-n side/ring resamples the same single-pixel cell for every slot,
+    so every resampled row shares one theta) -- observed in practice on
+    rings with only a handful of beam-cells. Redraw those rather than
+    letting one bad draw crash an otherwise-valid bootstrap; a run of 50
+    consecutive degenerate draws instead raises, since that means the
+    ring/side/scheme genuinely has too few independent cells to bootstrap.
+    """
     unique_cells, inverse = np.unique(cell_id, return_inverse=True)
     cell_pixels = [np.nonzero(inverse == i)[0] for i in range(len(unique_cells))]
     n_cells = len(unique_cells)
     s1_idx = terms.index("s1")
 
     draws = np.empty(n_bootstrap)
+    n_degenerate = 0
     for b in range(n_bootstrap):
-        sampled = rng.integers(0, n_cells, size=n_cells)
-        idx = np.concatenate([cell_pixels[c] for c in sampled])
-        d_b, th_b, sig_b = d[idx], theta_rad[idx], sigma_kms[idx]
-        w_b = compute_weights(th_b, sig_b, scheme, sigma_floor_kms)
-        fit_b = fit_wls(d_b, th_b, w_b, sig_b, terms)
+        for _attempt in range(50):
+            sampled = rng.integers(0, n_cells, size=n_cells)
+            idx = np.concatenate([cell_pixels[c] for c in sampled])
+            d_b, th_b, sig_b = d[idx], theta_rad[idx], sigma_kms[idx]
+            w_b = compute_weights(th_b, sig_b, scheme, sigma_floor_kms)
+            try:
+                fit_b = fit_wls(d_b, th_b, w_b, sig_b, terms)
+                break
+            except np.linalg.LinAlgError:
+                n_degenerate += 1
+        else:
+            raise RuntimeError(
+                f"block_bootstrap_s1: 50 consecutive degenerate resamples (rank-deficient "
+                f"design matrix) with n_cells={n_cells}. This ring/side/weighting combination "
+                "has too few independent beam-cells to bootstrap reliably."
+            )
         draws[b] = fit_b.p[s1_idx]
+    if n_degenerate:
+        print(f"[harmonic_fit]   block_bootstrap_s1: redrew {n_degenerate} degenerate "
+              f"resample(s) out of {n_bootstrap} (rank-deficient design, n_cells={n_cells})")
     return draws, n_cells
 
 
@@ -785,8 +876,10 @@ def main(cfg: Config):
 
 def _synthetic_mapset_and_ringlog(shape=(48, 48)):
     """Build a synthetic MapSet + ringlog on the real pixel grid, geometry
-    taken from stage_1_opt_parameters.txt so tests exercise the real WCS."""
-    ringlog_path = Path(__file__).parent / "stage_1_opt_parameters.txt"
+    taken from the TRM_paper model (the canonical paper run) so tests
+    exercise the real WCS. Any TRM model directory would do for this --
+    TRM_paper is just a fixed, always-present choice."""
+    ringlog_path = find_ringlog(Path(__file__).parent / "TRM_paper")
     ringlog = read_ringlog(ringlog_path)
 
     xc = float(ringlog[0]["XPOS(pix)"])
@@ -942,7 +1035,7 @@ def selftest():
           f"(dc0={dc0:.4f}, expected={expected_dc0:.4f}, ds1={ds1:.6f})")
 
     # ---------------- Test 7: beam bookkeeping ----------------
-    real_mapset = load_maps(Path(__file__).parent / "maps")
+    real_mapset = load_maps(Path(__file__).parent / "TRM_paper" / "maps")
     ppb7 = pixels_per_beam(real_mapset.bmaj_deg, real_mapset.bmin_deg,
                             real_mapset.cdelt1_deg, real_mapset.cdelt2_deg)
     ppb7_manual = (1.1331 * real_mapset.bmaj_deg * real_mapset.bmin_deg
@@ -961,20 +1054,62 @@ def selftest():
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--selftest", action="store_true")
-    parser.add_argument("--project-dir", default=str(Path(__file__).parent))
+    repo_root = Path(__file__).parent
+
+    parser = argparse.ArgumentParser(
+        description="Fit s1 = V_rad(R) for one TRM model directory (e.g. TRM_paper, fixed_PA42)."
+    )
+    parser.add_argument("--selftest", action="store_true", help="run the acceptance tests and exit")
+    parser.add_argument(
+        "--list-trm-models", action="store_true",
+        help="list TRM model directories found under the repo root and exit",
+    )
+    parser.add_argument(
+        "--trm-dir", default="TRM_paper",
+        help="TRM model directory: either a name relative to the repo root (e.g. 'fixed_PA42') "
+             "or an absolute/relative path to any directory containing maps/ and a ringlog. "
+             "Default: TRM_paper.",
+    )
+    parser.add_argument(
+        "--ringlog", default=None,
+        help="explicit path to the ringlog file, overriding auto-discovery within --trm-dir",
+    )
+    parser.add_argument(
+        "--results-dir", default=None,
+        help="where to write results/ (default: <trm-dir>/results)",
+    )
     args = parser.parse_args()
 
     if args.selftest:
         ok = selftest()
         sys.exit(0 if ok else 1)
 
-    project_dir = Path(args.project_dir)
+    if args.list_trm_models:
+        models = discover_trm_models(repo_root)
+        if not models:
+            print(f"[harmonic_fit] No TRM model directories found under {repo_root}")
+        else:
+            print(f"[harmonic_fit] TRM model directories found under {repo_root}:")
+            for name, path in models.items():
+                print(f"    {name}  ({find_ringlog(path).name})")
+        sys.exit(0)
+
+    trm_dir = Path(args.trm_dir)
+    if not trm_dir.is_absolute() and not trm_dir.exists():
+        trm_dir = repo_root / args.trm_dir
+    if not trm_dir.is_dir():
+        raise SystemExit(
+            f"--trm-dir {args.trm_dir!r} is not a directory (looked in {trm_dir}). "
+            f"Available: {sorted(discover_trm_models(repo_root))}"
+        )
+
+    ringlog_path = Path(args.ringlog) if args.ringlog else find_ringlog(trm_dir)
+    results_dir = Path(args.results_dir) if args.results_dir else trm_dir / "results"
+
     cfg = Config(
-        project_dir=project_dir,
-        maps_dir=project_dir / "maps",
-        ringlog_path=project_dir / "stage_1_opt_parameters.txt",
-        results_dir=project_dir / "results",
+        project_dir=trm_dir,
+        maps_dir=trm_dir / "maps",
+        ringlog_path=ringlog_path,
+        results_dir=results_dir,
     )
     main(cfg)

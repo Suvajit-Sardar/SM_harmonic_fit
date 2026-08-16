@@ -3,19 +3,20 @@ notebook from scratch; do not hand-edit the .ipynb directly."""
 
 import nbformat as nbf
 
-nb = nbf.v4.new_notebook()
-cells = []
+def build_notebook(trm_dir_name, available_models):
+    nb = nbf.v4.new_notebook()
+    cells = []
 
 
-def md(text):
-    cells.append(nbf.v4.new_markdown_cell(text.strip("\n")))
+    def md(text):
+        cells.append(nbf.v4.new_markdown_cell(text.strip("\n")))
 
 
-def code(text):
-    cells.append(nbf.v4.new_code_cell(text.strip("\n")))
+    def code(text):
+        cells.append(nbf.v4.new_code_cell(text.strip("\n")))
 
 
-md(r"""
+    md(r"""
 # VRM / VRMA cross-check
 
 Applies the Velocity Ring Model (VRM) and its azimuthally-resolved extension
@@ -38,10 +39,10 @@ global geometry -- and its rings are equal-width bins in *rescaled* radius
 over the full detected extent, not the Barolo tilted-ring edges this
 project's other notebook uses. VRM also has **no built-in error
 quantification** -- every number below is a point estimate, unlike the
-bootstrap + PA/VSYS-scan error budget in `harmonic_pipeline.ipynb`.
+bootstrap + PA/VSYS-scan error budget in `harmonic_pipeline_{TRM_DIR}.ipynb` (this project's per-TRM-model notebook, see scripts/build_notebook.py).
 """)
 
-code(r"""
+    code(r"""
 %matplotlib inline
 from pathlib import Path
 import numpy as np
@@ -54,10 +55,12 @@ from harmonic_plots import custom_rcparams
 from vrm.bridge import run_vrm, cell_field_to_full_frame
 
 mpl.rcParams.update(custom_rcparams)
-project_dir = Path.cwd()
+repo_root = Path.cwd()
+TRM_DIR = "__TRM_DIR_PLACEHOLDER__"  # which TRM model directory to cross-check
+trm_dir = repo_root / TRM_DIR
 """)
 
-md(r"""
+    md(r"""
 ## Geometry and data-quality cut
 
 Reuses this project's own ringlog, maps, and data-quality mask
@@ -68,9 +71,9 @@ global geometry is used for VRM, matching the tilted-ring model's own
 assumption in the inner disk.
 """)
 
-code(r"""
-ringlog = hf.read_ringlog(project_dir / "stage_1_opt_parameters.txt")
-mapset = hf.load_maps(project_dir / "maps")
+    code(r"""
+ringlog = hf.read_ringlog(hf.find_ringlog(trm_dir))
+mapset = hf.load_maps(trm_dir / "maps")
 cdelt1_sign = -1 if mapset.cdelt1_deg < 0 else (1 if mapset.cdelt1_deg > 0 else 0)
 
 row0 = ringlog[0]
@@ -82,7 +85,7 @@ sigma_artifact_floor_kms = 0.5  # same cut as harmonic_fit.Config's default
 print(f"PA = {pa_deg} deg, INC = {inc_deg} deg, Barolo VSYS = {vsys_barolo} km/s")
 """)
 
-md(r"""
+    md(r"""
 ## VRM: one (v_t, v_r) per ring
 
 `number_rings=4` to sit alongside this project's own 4-ring result -- but
@@ -91,7 +94,7 @@ edges, since VRM bins by rescaled radius over the full extent of the good
 pixels, whatever that extent turns out to be.
 """)
 
-code(r"""
+    code(r"""
 result_vrm = run_vrm(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_artifact_floor_kms,
                       number_rings=4, number_arch=1)
 
@@ -103,7 +106,7 @@ print(f"{result_vrm['n_good_pixels']} good pixels used")
 result_vrm["table"]
 """)
 
-md(r"""
+    md(r"""
 ## v_t(R) vs. Barolo's VROT, and v_r(R) vs. this project's s1(R)
 
 Marker size scales with `sqrt(n_points)` in each VRM bin -- a small marker
@@ -112,8 +115,8 @@ VRM ring in particular can extend past where Barolo's rings (and this
 project's own analysis) stop, into much sparser territory.
 """)
 
-code(r"""
-harm_table = Table.read(project_dir / "results" / "ring_results.ecsv", format="ascii.ecsv")
+    code(r"""
+harm_table = Table.read(trm_dir / "results" / "ring_results.ecsv", format="ascii.ecsv")
 primary_weighting = harm_table.meta["primary_weighting"]
 harm_both = harm_table[(harm_table["side"] == "both") & (harm_table["weighting"] == primary_weighting)]
 harm_both.sort("ring_index")
@@ -146,19 +149,19 @@ fig.tight_layout()
 None
 """)
 
-md(r"""
+    md(r"""
 ## VRMA: azimuthally-resolved v_r(R, theta)
 
 Splitting each ring into arcs trades points-per-bin for angular resolution.
 Given how patchy this data's azimuthal coverage already is at the per-ring
-level (see `fig_coverage` in `harmonic_pipeline.ipynb`), most bins at even
+level (see `fig_coverage` in `harmonic_pipeline_{TRM_DIR}.ipynb` (this project's per-TRM-model notebook, see scripts/build_notebook.py)), most bins at even
 modest resolution end up under-constrained -- shown explicitly via
 `n_points` (printed below) rather than smoothed over. Pixels in a bin with
 fewer than 3 points (an under- or exactly-determined 2-parameter fit) are
 left blank rather than colored by an unreliable estimate.
 """)
 
-code(r"""
+    code(r"""
 result_vrma = run_vrm(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_artifact_floor_kms,
                        number_rings=4, number_arch=4)
 t2 = result_vrma["table"]
@@ -170,7 +173,7 @@ print(f"{n_unreliable} / {n_total} (ring, arc) bins have fewer than 3 points")
 t2["ring_index", "arc_index", "r_arcsec_mean", "n_points", "v_t", "v_r"]
 """)
 
-code(r"""
+    code(r"""
 # Same map convention as harmonic_plots.py (fig_theta_map, fig_residual_maps,
 # etc.): a full-frame array in the original pixel grid, NaN outside good
 # pixels, shown with imshow -- not a scatter in some other coordinate
@@ -200,7 +203,7 @@ fig.tight_layout()
 None
 """)
 
-md(r"""
+    md(r"""
 ## How the VRM paper breaks the v_rad-PA (warp) degeneracy, vs. this project's approach
 
 Both this project and arXiv:2503.22306 are chasing the same worry -- that an
@@ -208,7 +211,7 @@ apparent radial-motion signal could actually be an artifact of getting the
 disc's geometry slightly wrong -- but they attack it from different
 directions, worth being explicit about before reproducing Figure 8 below.
 
-**This project's approach (`harmonic_fit.py`, `harmonic_pipeline.ipynb`) is
+**This project's approach (`harmonic_fit.py`, `harmonic_pipeline_{TRM_DIR}.ipynb` (this project's per-TRM-model notebook, see scripts/build_notebook.py)) is
 analytic and perturbative, for a single constant PA offset.** Holding
 `VROT` fixed at Barolo's value and fitting only `c0, s1`, a PA error `dPA`
 contributes a `sin(theta)` residual -- the same harmonic as `s1` itself.
@@ -255,7 +258,7 @@ sensitivity checks (neither finds a single simple geometry error that
 explains away the signal) is two independent methods pointing the same way.
 """)
 
-md(r"""
+    md(r"""
 ## Figure 8 reproduction: v_t, v_r, and their rank-correlation map, vs. a toy null model
 
 Reproduces Figure 8 of Sylos Labini, De Marzo & Straccamore (2025), ApJ 988,
@@ -295,7 +298,7 @@ empty cell -- a real number that would otherwise silently corrupt the
 correlation maps and the residual.
 """)
 
-code(r"""
+    code(r"""
 from vrm.bridge import run_figure8_analysis
 
 fig8 = run_figure8_analysis(mapset, xc, yc, pa_deg, inc_deg, cdelt1_sign, sigma_artifact_floor_kms,
@@ -316,7 +319,7 @@ print(f"C(sigma, v_t) = {fig8['C_sigma_vt']:.2f}, C(sigma, v_r) = {fig8['C_sigma
 fig8["table"]["ring_index", "arc_index", "n_points", "v_t", "v_r", "v_t_tm", "v_r_tm", "sigma_mean", "residual"]
 """)
 
-code(r"""
+    code(r"""
 t = fig8["table"]
 v_t_all = np.concatenate([np.asarray(t["v_t"]), np.asarray(t["v_t_tm"])])
 v_t_lim = (np.nanmin(v_t_all), np.nanmax(v_t_all))
@@ -345,7 +348,7 @@ fig.tight_layout()
 None
 """)
 
-md(r"""
+    md(r"""
 ### Added panel: LOS residual (not in the paper)
 
 Observed `v_los` minus the VRMA-reconstructed `v_los` (each cell's own
@@ -355,7 +358,7 @@ panel elsewhere in this project, here for the VRM fit rather than the
 harmonic fit.
 """)
 
-code(r"""
+    code(r"""
 resid_lim = np.nanmax(np.abs(np.asarray(t["residual"])))
 
 fig, ax = plt.subplots(figsize=(6.5, 6.5))
@@ -364,7 +367,7 @@ fig.tight_layout()
 None
 """)
 
-md(r"""
+    md(r"""
 ## Summary
 
 - VRM's independently-fit systemic velocity and this project's Barolo-ringlog
@@ -394,13 +397,43 @@ md(r"""
   signal, not a resolved warp/no-warp verdict.
 """)
 
-nb["cells"] = cells
-nb["metadata"] = {
-    "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-    "language_info": {"name": "python", "version": "3"},
-}
+    nb["cells"] = cells
+    nb["metadata"] = {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "version": "3"},
+    }
+    return nb
 
-out_path = "vrm_pipeline.ipynb"
-with open(out_path, "w") as f:
-    nbf.write(nb, f)
-print(f"Wrote {out_path}")
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    from pathlib import Path
+
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(REPO_ROOT))
+    import harmonic_fit as hf
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--trm-dir", default=None,
+        help="build only this TRM model's VRM notebook (default: all discovered TRM model directories)",
+    )
+    args = parser.parse_args()
+
+    models = hf.discover_trm_models(REPO_ROOT)
+    if not models:
+        raise SystemExit(f"No TRM model directories found under {REPO_ROOT}")
+
+    targets = [args.trm_dir] if args.trm_dir else sorted(models)
+    for name in targets:
+        if name not in models:
+            raise SystemExit(f"--trm-dir {name!r} not found; available: {sorted(models)}")
+        nb = build_notebook(name, sorted(models))
+        # substitute the placeholder TRM_DIR literal baked into the config cell's source
+        for cell in nb["cells"]:
+            cell["source"] = cell["source"].replace("__TRM_DIR_PLACEHOLDER__", name)
+        out_path = REPO_ROOT / f"vrm_pipeline_{name}.ipynb"
+        with open(out_path, "w") as f:
+            nbf.write(nb, f)
+        print(f"Wrote {out_path}")

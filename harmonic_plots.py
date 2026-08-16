@@ -10,6 +10,7 @@ weighting scheme, per CLAUDE.md.
 
 from __future__ import annotations
 
+import argparse
 import functools
 from pathlib import Path
 
@@ -655,4 +656,18 @@ def main(results_dir="results", figures_dir="figures"):
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Render all figures from one TRM model's results/ (see harmonic_fit.py --trm-dir)."
+    )
+    parser.add_argument(
+        "--results-dir", default="results",
+        help="directory written by harmonic_fit.py, e.g. TRM_paper/results or fixed_PA42/results. Default: results",
+    )
+    parser.add_argument(
+        "--figures-dir", default=None,
+        help="where to write the .pdf figures (default: <results-dir>/../figures)",
+    )
+    args = parser.parse_args()
+    results_dir = Path(args.results_dir)
+    figures_dir = Path(args.figures_dir) if args.figures_dir else results_dir.parent / "figures"
+    main(results_dir=results_dir, figures_dir=figures_dir)

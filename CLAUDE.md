@@ -13,41 +13,67 @@ error budget. `V_rad` at the level we are measuring it is degenerate with the
 disc position angle, and the pipeline must quantify that degeneracy rather than
 ignore it.
 
-### Deliverables (exactly three files, in the project root)
+### Deliverables (two shared modules in the project root, one notebook per TRM model)
 
 | File | Contains |
 |---|---|
-| `harmonic_fit.py` | All computation. Writes results to `results/`. No matplotlib import. |
-| `harmonic_plots.py` | All figures. Reads only `results/`. No FITS reading, no fitting. |
-| `harmonic_pipeline.ipynb` | Runs both, displays every figure inline with commentary. |
+| `harmonic_fit.py` | All computation. Writes results to `<trm_dir>/results/`. No matplotlib import. |
+| `harmonic_plots.py` | All figures. Reads only `<trm_dir>/results/`. No FITS reading, no fitting. |
+| `harmonic_pipeline_<model>.ipynb` | Runs both for one TRM model, displays every figure inline with commentary. |
 
 **Hard rule:** if a function both computes a number and draws something, it is in
 the wrong place. The separation exists so that figures can be re-iterated in the
 notebook without re-running the fit.
 
+`harmonic_fit.py` and `harmonic_plots.py` are single, shared modules — there is
+exactly one of each, in the project root, regardless of how many TRM models exist.
+What varies per TRM model is only the *input* (a directory under the project root,
+Section 1) and the generated notebook that runs the shared modules against it
+(Section 7). Do not fork or copy either module per model; a new TRM model should
+never require touching `harmonic_fit.py` or `harmonic_plots.py` at all.
+
 ---
 
 ## 1. Directory layout
 
+Each **TRM model** (a 3D-Barolo tilted-ring run) lives in its own subdirectory of
+the project root — `TRM_paper/` (the run used in the paper) and `fixed_PA42/` (a
+PA-fixed-to-42° comparison run) as of this writing, with more addable at any time
+(Section 1.1). Every TRM model directory is self-contained: its own `maps/`, its
+own ringlog file, and its own `results/`/`figures/` written by a run against it.
+`harmonic_fit.py` and `harmonic_plots.py` are shared, single modules at the
+project root that operate on whichever TRM model directory they're pointed at —
+they do not live inside a TRM model directory and are never copied per model.
+
 ```
 <project_root>/
-  maps/
-    *_0mom.fits              # data moment 0   (integrated intensity, unused)
-    *_1mom.fits              # data moment 1   (km/s; BUNIT=KM/S, verify not m/s)
-    *_2mom.fits              # data moment 2   (km/s; BUNIT=KM/S, verify not m/s)
-    *_local_0mom.fits        # Barolo MODEL moment 0 (unused)
-    *_local_1mom.fits        # Barolo MODEL moment 1
-    *_local_2mom.fits        # Barolo MODEL moment 2
-  stage_1_opt_parameters.txt
   harmonic_fit.py
   harmonic_plots.py
-  harmonic_pipeline.ipynb
-  results/
-    ring_results.ecsv       # scalar per (ring, side, weighting)
-    maps.npz                # 2D arrays: theta, R, weights, residuals
-    scans.npz               # chi2 cubes from the PA / VSYS scans
-  figures/
-    *.pdf
+  harmonic_pipeline_<model>.ipynb   # one per TRM model, e.g. harmonic_pipeline_TRM_paper.ipynb
+  vrm_pipeline_<model>.ipynb        # Section 9's supplementary cross-check, also one per model
+  scripts/
+    build_notebook.py               # generates harmonic_pipeline_<model>.ipynb for every TRM model
+    build_vrm_notebook.py           # generates vrm_pipeline_<model>.ipynb for every TRM model
+  <model_a>/                        # a TRM model directory, e.g. TRM_paper/
+    maps/
+      *_0mom.fits              # data moment 0   (integrated intensity, unused)
+      *_1mom.fits              # data moment 1   (km/s; BUNIT=KM/S, verify not m/s)
+      *_2mom.fits              # data moment 2   (km/s; BUNIT=KM/S, verify not m/s)
+      *_local_0mom.fits        # Barolo MODEL moment 0 (unused)
+      *_local_1mom.fits        # Barolo MODEL moment 1
+      *_local_2mom.fits        # Barolo MODEL moment 2
+    <ringlog>.txt               # filename varies per model (Section 1.1) -- auto-discovered
+    results/
+      ring_results.ecsv       # scalar per (ring, side, weighting)
+      maps.npz                # 2D arrays: theta, R, weights, residuals
+      scans.npz               # chi2 cubes from the PA / VSYS scans
+    figures/
+      *.pdf
+  <model_b>/                        # a second TRM model directory, e.g. fixed_PA42/
+    maps/
+    <ringlog>.txt
+    results/
+    figures/
 ```
 
 Note the moment index is a *suffix*, not `mom1`/`mom2` — actual filenames look like
@@ -59,6 +85,31 @@ is not used by this pipeline — do not glob it in by accident with an unanchore
 from data by the presence of `_local_` in the basename. Fail loudly with a clear
 message if either the data or model pair (`_1mom`/`_2mom`) is missing.
 
+### 1.1 Adding a new TRM model
+
+To add a new TRM model, create a new subdirectory of the project root containing:
+
+- a `maps/` folder with the six FITS files above (glob rules are per-directory, so
+  this works exactly like the existing models);
+- a ringlog `.txt` file: whitespace-delimited, `#`-commented header, with columns
+  including `RAD(Kpc)`, `RAD(arcs)`, `VROT(km/s)`, `E_VROT1`, `E_VROT2`, and the
+  rest of Section 4's required columns. The **filename is not fixed** — Barolo
+  ringlogs are named differently across runs (`stage_1_opt_parameters.txt`,
+  `PA_fixed_to_42.txt` are both seen in this project) — `harmonic_fit.find_ringlog`
+  identifies it by its columns, not its name, and deliberately rejects
+  `*_initial.txt`-style files (initial guesses only, missing `RAD(Kpc)`/`E_VROT1/2`)
+  and any other stray `.txt` sitting alongside it (stats dumps, etc.). If a
+  directory has zero or multiple files matching the required columns,
+  `find_ringlog` raises rather than guessing — pass `--ringlog` explicitly to
+  `harmonic_fit.py` in that case.
+
+That's it — no code changes are required. `harmonic_fit.discover_trm_models(repo_root)`
+finds any subdirectory with a `maps/` folder and a resolvable ringlog; run
+`python harmonic_fit.py --list-trm-models` to confirm a new model is picked up,
+then `python harmonic_fit.py --trm-dir <new_model>` to fit it and
+`python scripts/build_notebook.py` (no args rebuilds notebooks for *every*
+discovered model, including the new one) to get it a pipeline notebook.
+
 ---
 
 ## 2. Conventions — read this section before writing any code
@@ -68,8 +119,11 @@ Make it explicit and assert it at runtime.
 
 ### 2.1 Position angle
 
-`stage_1_opt_parameters.txt` gives `P.A. = 53.445`, measured north through east,
-pointing along the **receding** half of the major axis (Barolo's convention).
+The ringlog gives `P.A.`, measured north through east, pointing along the
+**receding** half of the major axis (Barolo's convention) — e.g. `TRM_paper`'s
+`stage_1_opt_parameters.txt` gives `P.A. = 53.445`; other TRM models (Section
+1.1) have their own `P.A.` in their own ringlog, by construction in the case of
+`fixed_PA42`.
 
 Array coordinates use `arctan2`, which measures counter-clockwise from `+x`.
 For a standard image (north up, east left, i.e. `CDELT1 < 0`, displayed
@@ -209,18 +263,22 @@ change what the code writes.
 
 ## 3. Ring definitions — resolved
 
-`stage_1_opt_parameters.txt` lists `RAD(arcs) = 43.0, 52.7, 62.4, 72.1`,
-uniformly spaced by 9.7″. **`RAD` is the ring *center*, confirmed by the project
-owner.** Ring *i* spans `RAD - 4.85` → `RAD + 4.85`:
-38.15–47.85, 47.85–57.55, 57.55–67.25, 67.25–76.95.
+`TRM_paper`'s `stage_1_opt_parameters.txt` lists `RAD(arcs) = 43.0, 52.7, 62.4,
+72.1`, uniformly spaced by 9.7″. **`RAD` is the ring *center*, confirmed by the
+project owner.** Ring *i* spans `RAD - 4.85` → `RAD + 4.85`:
+38.15–47.85, 47.85–57.55, 57.55–67.25, 67.25–76.95. This is the `TRM_paper`
+example; other TRM models (Section 1.1) have their own `RAD` grid in their own
+ringlog — `fixed_PA42`'s, for instance, is `42.0, 51.8, 61.6, 71.4`, spaced by
+9.8″ — but the *convention* below (RAD = ring center, width from `np.diff`) is
+the same for every model, never per-model configuration.
 
-This is not configurable — there is no `rad_convention` toggle and no
-`"inner_edge"` reading. It reproduces the ring bounds of the previous script
-exactly, each row carries its own `VROT`/`E_VROT` (per-ring quantities), and it
-is BBarolo's documented ringlog convention. Print the resulting ring bounds at
-the top of every run, and stamp `"RAD = ring center"` into every figure caption
-and the results file header, so the convention is still visible downstream even
-though it is no longer a choice.
+This convention is not configurable — there is no `rad_convention` toggle and no
+`"inner_edge"` reading, for any TRM model. It reproduces the ring bounds of the
+previous script exactly for `TRM_paper`, each row carries its own `VROT`/`E_VROT`
+(per-ring quantities), and it is BBarolo's documented ringlog convention. Print
+the resulting ring bounds at the top of every run, and stamp `"RAD = ring
+center"` into every figure caption and the results file header, so the
+convention is still visible downstream even though it is no longer a choice.
 
 Derive ring width from `np.diff(RAD)` rather than hardcoding 9.7, and assert
 uniform spacing.
@@ -265,6 +323,9 @@ A single `@dataclass` at the top, instantiated in `main()`. Fields:
 
 ```
 project_dir, maps_dir, ringlog_path, results_dir
+    # project_dir is a TRM model directory (Section 1), not the repo root --
+    # maps_dir/ringlog_path/results_dir default to <project_dir>/maps,
+    # find_ringlog(project_dir), and <project_dir>/results respectively.
 weighting_schemes       : ("uniform", "sin2", "invvar")
 primary_weighting       : "sin2"
 model_terms             : ("c0", "s1")                 # c1 always fixed
@@ -652,13 +713,23 @@ weighting scheme.
 
 ---
 
-## 7. `harmonic_pipeline.ipynb`
+## 7. `harmonic_pipeline_<model>.ipynb`
 
-Generate it programmatically with `nbformat`. Structure:
+Generated programmatically with `nbformat` by `scripts/build_notebook.py`, one
+notebook per TRM model directory (Section 1): `harmonic_pipeline_TRM_paper.ipynb`,
+`harmonic_pipeline_fixed_PA42.ipynb`, and so on. `build_notebook.py` discovers
+TRM models via `harmonic_fit.discover_trm_models(repo_root)` and, with no
+arguments, (re)builds every discovered model's notebook in one run — a new TRM
+model (Section 1.1) gets a notebook automatically, with no template edits.
+`--trm-dir <name>` rebuilds just one. Structure (identical for every model,
+parameterized only by `TRM_DIR` in the config cell):
 
 1. Markdown: purpose, the ring-center convention (`RAD` is the ring center, not
-   the inner edge) and its consequence, the sign-convention caveat.
-2. Config cell — the one place a user edits anything.
+   the inner edge) and its consequence, the sign-convention caveat, and which
+   TRM model this particular notebook targets.
+2. Config cell — the one place a user edits anything, normally just `TRM_DIR`
+   (e.g. `TRM_DIR = "TRM_paper"`); `maps_dir`, `ringlog_path` (via
+   `hf.find_ringlog`), and `results_dir` are all derived from it.
 3. Load ringlog and maps; display the ring table and the header-derived beam.
 4. Geometry + the Section 2.3 assertion.
 5. Run the fit (this one call also produces the PA/VSYS scans and the
@@ -714,16 +785,18 @@ result from real data is trusted.
 
 ## 9. Supplementary: VRM/VRMA cross-check
 
-`vrm_pipeline.ipynb` (generated by `scripts/build_vrm_notebook.py`) is an
-independent cross-check of `s1(R)` against the Velocity Ring Model (VRM) and
-VRM-with-arcs (VRMA) method — Sylos Labini, Straccamore, De Marzo & Comerón,
-MNRAS 524, 1560 (2023), arXiv:2306.12902 — plus a reproduction of the
-rank-correlation / toy-model warp diagnostic (their Figure 8) from the
-companion paper Sylos Labini, De Marzo & Straccamore, ApJ 988, 122 (2025),
-doi:10.3847/1538-4357/adc71c, arXiv:2503.22306. It is **not** part of the
-three-file deliverable in Section 0 and does not change any of its rules;
-it is a separate, additive analysis that reads this project's own
-`results/ring_results.ecsv` plus the maps, and otherwise stands alone.
+`vrm_pipeline_<model>.ipynb` (generated by `scripts/build_vrm_notebook.py`, one
+per TRM model directory, same discovery/CLI pattern as
+`scripts/build_notebook.py` in Section 7) is an independent cross-check of
+`s1(R)` against the Velocity Ring Model (VRM) and VRM-with-arcs (VRMA) method —
+Sylos Labini, Straccamore, De Marzo & Comerón, MNRAS 524, 1560 (2023),
+arXiv:2306.12902 — plus a reproduction of the rank-correlation / toy-model warp
+diagnostic (their Figure 8) from the companion paper Sylos Labini, De Marzo &
+Straccamore, ApJ 988, 122 (2025), doi:10.3847/1538-4357/adc71c,
+arXiv:2503.22306. It is **not** part of the deliverables in Section 0 and does
+not change any of its rules; it is a separate, additive analysis that reads
+its own TRM model's `<trm_dir>/results/ring_results.ecsv` plus its maps, and
+otherwise stands alone.
 
 - `vrm/VRM_VRMA.py` is vendored **unmodified** from
   https://github.com/MatteoStraccamore/VRM_VRMA. See `vrm/README.md` for
