@@ -90,7 +90,7 @@ SIDE_MARKERS = {"both": "o", "approaching": "s", "receding": "^"}
 class Results:
     def __init__(self, results_dir: Path):
         results_dir = Path(results_dir)
-        self.table = Table.read(results_dir / "ring_results.ecsv", format="ascii.ecsv")
+        self.table = Table.read(str(results_dir / "ring_results.ecsv"), format="ascii.ecsv")
         self.maps = dict(np.load(results_dir / "maps.npz"))
         self.scans = dict(np.load(results_dir / "scans.npz"))
         self.rad_convention = self.table.meta.get("rad_convention", "RAD = ring center")
