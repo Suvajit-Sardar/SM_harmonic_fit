@@ -79,6 +79,12 @@ _MODEL_TERM_FUNCS = {
 
 
 def design_matrix(theta: np.ndarray, terms: Sequence[str]) -> np.ndarray:
+    if len(terms) == 0:
+        # np.column_stack([]) raises -- an empty design matrix is a legitimate
+        # case here: it arises when "c0" is toggled out of model_terms (see
+        # Config.model_terms) and the scan/profile code is left profiling over
+        # zero nuisance terms.
+        return np.zeros((len(theta), 0))
     return np.column_stack([_MODEL_TERM_FUNCS[t](theta) for t in terms])
 
 

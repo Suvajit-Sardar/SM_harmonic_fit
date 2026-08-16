@@ -214,6 +214,50 @@ None
 """)
 
 md(r"""
+## c0 toggle: fitting with and without the offset nuisance term
+
+`c0` is a per-ring free offset that absorbs both `dVSYS / sin(i)` (an error
+in the systemic velocity) and `V_z / tan(i)` (vertical motion) without
+separating them (`CLAUDE.md` 2.5). `model_terms` is the single config knob
+that controls which terms are fit (`s1` is always required; `c0`, and
+optionally `c2`/`s2`, are toggled by including or omitting them) -- so
+"fitting without c0" means rerunning `harmonic_fit.main()` with
+`model_terms=("s1",)` instead of the default `("c0", "s1")`, into a second
+`results_dir` so the two result sets don't overwrite each other.
+
+Under perfectly symmetric azimuthal coverage `c0` and `s1` are orthogonal
+(`L0 = 0`, `CLAUDE.md` 5.6), so removing `c0` should show up almost entirely
+as a near-uniform, per-ring offset in the post-fit residual map -- not as a
+shift in `s1`. The comparison below is the direct, on-this-data check of how
+well that holds once blanked/masked pixels break the symmetry.
+""")
+
+code(r"""
+import dataclasses
+
+cfg_no_c0 = dataclasses.replace(cfg, results_dir=cfg.results_dir / "no_c0", model_terms=("s1",))
+results_table_no_c0 = hf.main(cfg_no_c0)
+""")
+
+code(r"""
+res_no_c0 = hp.load_results(cfg_no_c0.results_dir)
+
+hp.fig_c0_toggle_residuals(res, res_no_c0)
+hp.fig_c0_toggle_s1(res, res_no_c0)
+None
+""")
+
+md(r"""
+If the left/right residual-map panels above differ mainly by a per-ring
+constant shift (visually: same structure, offset in color), and the `s1`
+points in the left comparison panel agree within their bootstrap error bars,
+`c0` is doing exactly the job it's meant to -- soaking up an offset that
+isn't `s1`. Any ring where `s1` shifts by more than its bootstrap width is a
+direct, quantitative sign that this ring's masked coverage breaks the
+`c0`/`s1` orthogonality (i.e. non-zero `L0`, figure 2) enough to matter.
+""")
+
+md(r"""
 ## The V_rad-PA degeneracy: analytic derivation
 
 A PA error `dPA` contributes a `sin(theta)` term to the residual -- the same
