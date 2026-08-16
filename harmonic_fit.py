@@ -562,7 +562,7 @@ def n_effective(n_pix, ppb):
     return n_pix / ppb
 
 
-def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng):
+def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng, ppb):
     xc, yc = float(ringlog_row["XPOS(pix)"]), float(ringlog_row["YPOS(pix)"])
     pa0 = float(ringlog_row["P.A.(deg)"])
     inc = float(ringlog_row["INC(deg)"])
@@ -578,7 +578,6 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng):
     base_mask = base_mask_raw & quality_mask
     n_removed_by_quality_mask = int(np.sum(base_mask_raw & ~quality_mask))
 
-    ppb = pixels_per_beam(mapset.bmaj_deg, mapset.bmin_deg, mapset.cdelt1_deg, mapset.cdelt2_deg)
     cell_side_pix = int(np.ceil(np.sqrt(ppb)))
     y_idx, x_idx = np.indices(mapset.shape)
     cell_id_full = beam_cell_ids(y_idx, x_idx, cell_side_pix, mapset.shape[1])
@@ -649,6 +648,7 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng):
                 n_pix=n_pix,
                 n_eff=n_eff,
                 n_cells=n_cells,
+                pixels_per_beam=ppb,
                 L0=L0,
                 L1=L1,
                 rms_residual=rms,
@@ -696,6 +696,10 @@ def main(cfg: Config):
     print(f"[harmonic_fit] CDELT1 = {mapset.cdelt1_deg} deg/pix (sign={cdelt1_sign}); "
           f"pixel scale = {mapset.pixscale_arcsec:.3f} arcsec/pix")
 
+    ppb = pixels_per_beam(mapset.bmaj_deg, mapset.bmin_deg, mapset.cdelt1_deg, mapset.cdelt2_deg)
+    print(f"[harmonic_fit] beam = {mapset.bmaj_deg*3600:.3f}\" x {mapset.bmin_deg*3600:.3f}\"; "
+          f"pixels_per_beam = {ppb:.3f}")
+
     # Section 2.3 assertion -- fire on the outermost ring, once, before trusting anything else.
     outer_row = ringlog[-1]
     xc0, yc0 = float(outer_row["XPOS(pix)"]), float(outer_row["YPOS(pix)"])
@@ -722,7 +726,7 @@ def main(cfg: Config):
     all_scans = {}
     for ring_idx, ringlog_row in enumerate(ringlog):
         rows, maps_extra, pa_result, vsys_result, boot_extra = process_ring(
-            cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng
+            cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng, ppb
         )
         all_rows.extend(rows)
         for k, v in maps_extra.items():
@@ -740,6 +744,9 @@ def main(cfg: Config):
     results_table.meta["rad_convention"] = "RAD = ring center"
     results_table.meta["primary_weighting"] = cfg.primary_weighting
     results_table.meta["kpc_per_arcsec"] = ringlog.meta["kpc_per_arcsec"]
+    results_table.meta["bmaj_arcsec"] = mapset.bmaj_deg * 3600.0
+    results_table.meta["bmin_arcsec"] = mapset.bmin_deg * 3600.0
+    results_table.meta["pixels_per_beam"] = ppb
     results_table.meta["config"] = {
         k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.__dict__.items()
     }
@@ -927,6 +934,17 @@ def selftest():
     check("6. Round trip: constant V_z-like offset (12.3 km/s in V_los) appears in c0, not s1",
           np.isclose(dc0, expected_dc0, atol=1e-6) and np.isclose(ds1, 0.0, atol=1e-6),
           f"(dc0={dc0:.4f}, expected={expected_dc0:.4f}, ds1={ds1:.6f})")
+
+    # ---------------- Test 7: beam bookkeeping ----------------
+    real_mapset = load_maps(Path(__file__).parent / "maps")
+    ppb7 = pixels_per_beam(real_mapset.bmaj_deg, real_mapset.bmin_deg,
+                            real_mapset.cdelt1_deg, real_mapset.cdelt2_deg)
+    ppb7_manual = (1.1331 * real_mapset.bmaj_deg * real_mapset.bmin_deg
+                   / abs(real_mapset.cdelt1_deg * real_mapset.cdelt2_deg))
+    check("7. Beam bookkeeping: pixels_per_beam == 1.1331*BMAJ*BMIN/|CDELT1*CDELT2| "
+          "(header formula) and == 20.69 +/- 0.01 for the shipped map",
+          np.isclose(ppb7, ppb7_manual, atol=1e-9) and np.isclose(ppb7, 20.69, atol=0.01),
+          f"(pixels_per_beam={ppb7:.4f})")
 
     print(f"\n[selftest] {n_pass} passed, {n_fail} failed")
     return n_fail == 0

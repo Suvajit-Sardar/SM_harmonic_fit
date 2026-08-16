@@ -154,11 +154,45 @@ Data, the Barolo model (through the same wedges and mask, so it carries the
 same beam smearing), and the harmonic fit, all against azimuth. Where data
 and Barolo diverge but data and the harmonic fit agree, that gap *is* the
 `s1` detection, shown directly.
+
+Error bars are the per-ring fit residual RMS divided by `sqrt(beams per
+wedge)`, not the raw within-wedge pixel scatter -- at this dataset's beam
+size (~20.7 pixels/beam) a wedge holds well under one independent beam even
+at the `AZIMUTHAL_N_WEDGE = 12` used here, so the within-wedge scatter would
+mostly measure the model's own gradient across the wedge (largest near the
+minor axis, exactly where the `s1` signal lives) rather than measurement
+noise. Markers sit at each wedge's weighted circular centroid, not its
+geometric center.
 """)
 
 code(r"""
-hp.fig_azimuthal_vlos(res)
+hp.fig_azimuthal_vlos(res, n_wedge=hp.AZIMUTHAL_N_WEDGE)
 None
+""")
+
+md(r"""
+**Beams per wedge** (this belongs in the paper regardless of how the figure
+ends up looking, since it is what justifies the error-bar model above):
+
+| ring | n_eff (beams in ring) | median beams/wedge (N=12) | old median error bar | new median error bar | old max/min ratio | new max/min ratio |
+|---|---|---|---|---|---|---|
+| 0 | 2.85 | 1.00 | 14.8 km/s | 19.0 km/s | inf (exact-zero wedges) | 1.00 |
+| 1 | 5.51 | 1.00 | 20.4 km/s | 15.6 km/s | 41.4 | 1.00 |
+| 2 | 6.72 | 1.00 | 15.0 km/s | 17.6 km/s | inf (exact-zero wedges) | 1.00 |
+| 3 | 4.74 | 1.00 | 13.7 km/s | 18.1 km/s | inf (exact-zero wedges) | 1.00 |
+
+Every wedge in every ring, even at the coarser 12-wedge resolution, holds
+fewer pixels than one beam (`pixels_per_beam = 20.69`) -- so the beam floor
+in the new error model binds everywhere, and the error bars come out exactly
+flat within each ring (ratio = 1.00), not merely flatter than before. The
+old (pre-fix) formula's ratio is not just "a few times too large": three of
+the four rings have at least one wedge with exactly one pixel, where the
+within-wedge weighted variance of a single point about its own mean is
+exactly zero, making that wedge's old error bar exactly zero and the
+max/min ratio formally infinite -- a sharper failure than the systematic
+`sin(theta)`-tracking bias the fix targets, and a direct consequence of the
+same root cause (estimating scatter from far fewer independent samples than
+pixels).
 """)
 
 md(r"""

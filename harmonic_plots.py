@@ -10,6 +10,7 @@ weighting scheme, per CLAUDE.md.
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import matplotlib as mpl
@@ -68,6 +69,12 @@ mpl.rcParams.update(custom_rcparams)
 _EXTENT_BAND_ARCSEC = (73.2228 / 2.0, 148.0 / 2.0)
 
 N_WEDGE = 24
+# fig_azimuthal_vlos's actual resolution: at this dataset's beam (~20.7
+# pixels/beam), 24 wedges draws several markers per independent beam within
+# a ring (ring 0 has only 3.87 beams total). 12 roughly halves that
+# oversampling without dropping below the angular resolution sin2 weighting
+# needs near the minor axis to show the fit tracking the data.
+AZIMUTHAL_N_WEDGE = 12
 RING_COLORS = ["darkblue", "magenta", "green", "red"]
 RING_MARKERS = ["o", "s", "^", "D"]
 SIDE_COLORS = {"both": "green", "approaching": "blue", "receding": "red"}
@@ -258,7 +265,13 @@ def fig_residual_maps(res: Results):
 # --------------------------------------------------------------------------
 
 
-def fig_azimuthal_vlos(res: Results):
+def fig_azimuthal_vlos(res: Results, n_wedge: int = N_WEDGE):
+    """Error bars are the ring-level residual RMS (from the fit, which has
+    the cos(theta)/radial gradients already removed) divided by
+    sqrt(beams-per-wedge), not the within-wedge pixel scatter -- at this
+    dataset's beam size every wedge holds under one independent beam, so the
+    within-wedge scatter measures the model gradient across the wedge, not
+    measurement noise (see CLAUDE.md / the fig_azimuthal_vlos task notes)."""
     data_mom1 = res.maps["data_mom1"]
     model_mom1 = res.maps["model_mom1"]
 
@@ -266,22 +279,25 @@ def fig_azimuthal_vlos(res: Results):
     if res.n_rings == 1:
         axes = [axes]
 
-    theta_edges = np.linspace(0, 360, N_WEDGE + 1)
-    theta_centers = (theta_edges[:-1] + theta_edges[1:]) / 2.0
+    theta_edges = np.linspace(0, 360, n_wedge + 1)
 
     for i, ax in enumerate(axes):
         theta = res.maps[f"ring{i}_theta"]
         mask = res.maps[f"ring{i}_ring_mask_both"]
         w = res.maps[f"ring{i}_weights_primary"]
         row = res.row(i)
-        ppb = row["n_pix"] / row["n_eff"] if row["n_eff"] > 0 else np.nan
+        ppb = row["pixels_per_beam"]
+        sin_inc = np.sin(np.radians(row["inc_deg"]))
+        rms_residual = row["rms_residual"]
 
         theta_deg = np.degrees(theta) % 360.0
-        data_pts = np.full(N_WEDGE, np.nan)
-        data_err = np.full(N_WEDGE, np.nan)
-        model_pts = np.full(N_WEDGE, np.nan)
+        data_pts = np.full(n_wedge, np.nan)
+        data_err = np.full(n_wedge, np.nan)
+        model_pts = np.full(n_wedge, np.nan)
+        theta_plot = np.full(n_wedge, np.nan)
+        n_beams_wedge = np.full(n_wedge, np.nan)
 
-        for j in range(N_WEDGE):
+        for j in range(n_wedge):
             wedge = mask & (theta_deg >= theta_edges[j]) & (theta_deg < theta_edges[j + 1])
             n_wedge_pix = int(np.sum(wedge))
             if n_wedge_pix == 0:
@@ -293,13 +309,23 @@ def fig_azimuthal_vlos(res: Results):
             if wsum <= 0:
                 continue
             wmean = np.sum(wv * dv) / wsum
-            wvar = np.sum(wv * (dv - wmean) ** 2) / wsum
-            n_beams = max(n_wedge_pix / ppb, 1e-6) if np.isfinite(ppb) else n_wedge_pix
+            n_beams = max(n_wedge_pix / ppb, 1.0) if np.isfinite(ppb) else max(float(n_wedge_pix), 1.0)
+            theta_w = np.degrees(np.arctan2(np.sum(wv * np.sin(theta[wedge])),
+                                             np.sum(wv * np.cos(theta[wedge])))) % 360.0
             data_pts[j] = wmean
-            data_err[j] = np.sqrt(wvar) / np.sqrt(n_beams)
+            data_err[j] = (rms_residual * sin_inc) / np.sqrt(n_beams)
             model_pts[j] = np.sum(wv * mv) / wsum
+            theta_plot[j] = theta_w
+            n_beams_wedge[j] = n_beams
 
-        theta_c_shift = np.where(theta_centers < 90, theta_centers + 360, theta_centers)
+        valid = np.isfinite(theta_plot)
+        if np.sum(valid) >= 2:
+            ratio = np.nanmax(data_err[valid]) / np.nanmin(data_err[valid])
+        else:
+            ratio = np.nan
+        print(f"[fig_azimuthal_vlos] ring {i}: max/min error bar ratio = {ratio:.2f}")
+
+        theta_c_shift = np.where(theta_plot < 90, theta_plot + 360, theta_plot)
         order = np.argsort(theta_c_shift)
 
         ax.errorbar(theta_c_shift[order], data_pts[order], yerr=data_err[order], fmt="o", color="black",
@@ -325,10 +351,19 @@ def fig_azimuthal_vlos(res: Results):
         if i == 0:
             ax.set_ylabel(r"$V_{\rm LOS}$ [km s$^{-1}$]")
         ax.set_title(f"ring {i}: {row['r_in_arcsec']:.1f}-{row['r_out_arcsec']:.1f}\"")
-        ax.legend(fontsize=10)
+        ax.legend(fontsize=10, loc="lower right")
+
+        median_beams = np.nanmedian(n_beams_wedge[np.isfinite(n_beams_wedge)]) if np.any(np.isfinite(n_beams_wedge)) else np.nan
+        info_text = (f"n_beams(ring) = {row['n_eff']:.1f}\n"
+                     f"n_wedges = {n_wedge}\n"
+                     f"median n_beams/wedge = {median_beams:.2f}")
+        ax.text(0.02, 0.98, info_text, transform=ax.transAxes, va="top", ha="left", fontsize=9,
+                bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray", alpha=0.85))
+
         ax.xaxis.set_minor_locator(AutoMinorLocator(3))
 
-    fig.suptitle(f"Azimuthal V_LOS: data vs. Barolo model vs. harmonic fit {res.caption_tag()}")
+    fig.suptitle(f"Azimuthal V_LOS: data vs. Barolo model vs. harmonic fit {res.caption_tag()}\n"
+                 f"error bars = ring residual RMS / sqrt(beams per wedge); adjacent points are correlated on the beam scale")
     fig.tight_layout()
     return fig
 
@@ -505,7 +540,7 @@ ALL_FIGURES = [
     ("fig_theta_map", fig_theta_map),
     ("fig_coverage", fig_coverage),
     ("fig_residual_maps", fig_residual_maps),
-    ("fig_azimuthal_vlos", fig_azimuthal_vlos),
+    ("fig_azimuthal_vlos", functools.partial(fig_azimuthal_vlos, n_wedge=AZIMUTHAL_N_WEDGE)),
     ("fig_pa_degeneracy", fig_pa_degeneracy),
     ("fig_vsys_degeneracy", fig_vsys_degeneracy),
     ("fig_s1_vs_pa", fig_s1_vs_pa),
