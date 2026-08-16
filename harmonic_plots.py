@@ -261,6 +261,96 @@ def fig_residual_maps(res: Results):
 
 
 # --------------------------------------------------------------------------
+# c0 toggle comparison -- fits with vs. without the c0 nuisance term
+# --------------------------------------------------------------------------
+#
+# c0 absorbs both dVSYS/sin(i) and V_z/tan(i) without separating them
+# (CLAUDE.md 2.5). "Toggling c0 off" means running harmonic_fit.main() a
+# second time with "c0" dropped from Config.model_terms (e.g.
+# model_terms=("s1",)) into a second results_dir -- this module never fits,
+# it only compares the two already-written Results.
+
+
+def fig_c0_toggle_residuals(res_with_c0: Results, res_without_c0: Results):
+    """Post-fit residual maps (side=both, primary weighting), c0 free vs. c0
+    fixed at 0. Under symmetric azimuthal coverage c0 and s1 are orthogonal,
+    so fixing c0=0 should reappear almost entirely as a near-uniform,
+    per-ring offset in the residual map (rather than biasing s1) -- this
+    figure shows whether that holds ring by ring on the real, masked data."""
+    post_with = _combined_ring_map(res_with_c0, "dv_postfit", combine="nan_fill")
+    post_without = _combined_ring_map(res_without_c0, "dv_postfit", combine="nan_fill")
+
+    all_vals = np.concatenate([post_with[np.isfinite(post_with)], post_without[np.isfinite(post_without)]])
+    vmax = np.nanpercentile(np.abs(all_vals), 98) if len(all_vals) else 1.0
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6.5))
+
+    im1 = ax1.imshow(post_with, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    _overlay_ring_ellipses(res_with_c0, ax1)
+    fig.colorbar(im1, ax=ax1, fraction=0.046, label="km/s")
+    ax1.set_title("Post-fit residual, c0 free")
+
+    im2 = ax2.imshow(post_without, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    _overlay_ring_ellipses(res_without_c0, ax2)
+    fig.colorbar(im2, ax=ax2, fraction=0.046, label="km/s")
+    ax2.set_title("Post-fit residual, c0 fixed at 0")
+
+    c0_text = "   ".join(
+        f"ring{i}: c0={res_with_c0.row(i)['c0']:.2f}±{res_with_c0.row(i)['c0_err']:.2f} km/s"
+        for i in range(res_with_c0.n_rings)
+    )
+    fig.suptitle(
+        f"c0 toggle: post-fit residual, c0 free vs. fixed at 0 {res_with_c0.caption_tag()}\n{c0_text}",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def fig_c0_toggle_s1(res_with_c0: Results, res_without_c0: Results):
+    """s1(R) and post-fit RMS residual, side=both, primary weighting, c0 free
+    vs. fixed at 0. A shift in s1 beyond the bootstrap width is a direct
+    measurement of L0 leakage (CLAUDE.md 5.6) from this ring's specific
+    coverage asymmetry -- not expected under symmetric coverage."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
+    for res, off, color, label in (
+        (res_with_c0, -0.1, "black", "c0 free"),
+        (res_without_c0, 0.1, "crimson", "c0 = 0"),
+    ):
+        sub = res.rows(side="both", weighting=res.primary_weighting)
+        sub = sub[np.argsort(sub["ring_index"])]
+        yerr = np.vstack([sub["s1"] - sub["s1_boot_lo"], sub["s1_boot_hi"] - sub["s1"]])
+        ax1.errorbar(sub["ring_index"] + off, sub["s1"], yerr=yerr, fmt="o", color=color,
+                     markeredgecolor="black", capsize=4, label=label)
+
+    ax1.axhline(0, color="gray", linestyle=":")
+    ax1.set_xticks(range(res_with_c0.n_rings))
+    ax1.set_xlabel("ring index")
+    ax1.set_ylabel(r"$s_1$ [km s$^{-1}$]")
+    ax1.legend()
+    ax1.set_title("s1: c0 free vs. c0 = 0")
+
+    sub_with = res_with_c0.rows(side="both", weighting=res_with_c0.primary_weighting)
+    sub_with = sub_with[np.argsort(sub_with["ring_index"])]
+    sub_without = res_without_c0.rows(side="both", weighting=res_without_c0.primary_weighting)
+    sub_without = sub_without[np.argsort(sub_without["ring_index"])]
+    ring_idx = np.asarray(sub_with["ring_index"], dtype=float)
+    width = 0.35
+    ax2.bar(ring_idx - width / 2, sub_with["rms_residual"], width=width, color="black", label="c0 free")
+    ax2.bar(ring_idx + width / 2, sub_without["rms_residual"], width=width, color="crimson", label="c0 = 0")
+    ax2.set_xticks(ring_idx)
+    ax2.set_xlabel("ring index")
+    ax2.set_ylabel("post-fit RMS residual [km s$^{-1}$]")
+    ax2.legend()
+    ax2.set_title("Post-fit RMS: c0 free vs. c0 = 0")
+
+    fig.suptitle(f"c0 toggle comparison {res_with_c0.caption_tag()}")
+    fig.tight_layout()
+    return fig
+
+
+# --------------------------------------------------------------------------
 # 6.3 Data vs model, azimuthal
 # --------------------------------------------------------------------------
 

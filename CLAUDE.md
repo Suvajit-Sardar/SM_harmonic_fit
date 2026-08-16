@@ -517,6 +517,22 @@ Print a compact summary table to stdout. Do **not** call
 script did, which would also have hidden genuine all-NaN slices. Scope any
 suppression to the specific statement that needs it.
 
+### 5.10 The `c0` toggle
+
+`c0` absorbs both `dVSYS / sin(i)` and `V_z / tan(i)` without separating them
+(Section 2.5). There is no separate boolean flag for this — `model_terms`
+(Section 5.1) is already the single config knob that controls which terms are
+free (`s1` is always required; `c0`, and optionally `c2`/`s2`, are toggled by
+including or omitting them from the tuple), so fitting without `c0` means
+calling `main()` a second time with `model_terms=("s1",)` into a second
+`results_dir` (the notebook uses `cfg.results_dir / "no_c0"`), rather than
+reusing the first one — the two result trees must not collide.
+
+`design_matrix` and the scan/profile helpers in `harmonic_fit.py` must handle
+an **empty** nuisance-term tuple (i.e. `model_terms=("s1",)`, so the PA/VSYS
+scans profile over zero nuisance parameters) without raising — this is what
+makes the toggle actually usable, not just representable in `model_terms`.
+
 ---
 
 ## 6. `harmonic_plots.py`
@@ -565,6 +581,24 @@ weighting scheme.
    - **Post-fit** (right): residual after subtracting `s1*sin(theta)`. Should
      be structureless; any coherent pattern remaining is the argument for
      adding `c2, s2`.
+
+3b. **`fig_c0_toggle_residuals`** and **`fig_c0_toggle_s1`** — the `c0`-toggle
+    comparison (Section 5.10). Unlike every other figure function, these two
+    take **two** `Results` objects (one fit with `c0` free, one with `c0`
+    fixed at 0) rather than one, since the comparison is the whole point; they
+    are not part of `ALL_FIGURES` / `harmonic_plots.main()` and are only
+    called from the notebook, which is the one place both result trees exist
+    at once.
+    - `fig_c0_toggle_residuals`: post-fit residual maps, `c0` free vs. fixed
+      at 0, same layout and shared colormap/scale as `fig_residual_maps`, with
+      each ring's fitted `c0` ± its formal error in the title. Under symmetric
+      coverage this should look like the same structure shifted by a
+      near-uniform per-ring offset, not a change in shape.
+    - `fig_c0_toggle_s1`: `s1(R)` and post-fit RMS residual, `c0` free vs.
+      fixed at 0, side by side. An `s1` shift larger than the bootstrap width
+      between the two is a direct, on-this-data measurement of `L0` leakage
+      (Section 5.6) from this ring's masked coverage — not expected under
+      symmetric coverage, where `c0` and `s1` are orthogonal.
 
 ### 6.3 Data vs model, azimuthal
 
@@ -635,6 +669,10 @@ Generate it programmatically with `nbformat`. Structure:
 8. Figure 3 (`fig_azimuthal_vlos`).
 9. Figure 4 (`fig_residual_maps`), with a markdown cell prompting explicit
    inspection of the pre-fit panel before trusting anything below it.
+9b. The `c0` toggle (Section 5.10): rerun `main()` with a second `Config`
+    (`dataclasses.replace(cfg, results_dir=cfg.results_dir / "no_c0",
+    model_terms=("s1",))`), load both result trees, and display
+    `fig_c0_toggle_residuals` / `fig_c0_toggle_s1`.
 10. Figures 5–7 (`fig_pa_degeneracy`, `fig_vsys_degeneracy`, `fig_s1_vs_pa`) —
     reads the scan grids already computed in step 5, no extra computation.
 11. Figures 8–9 (`fig_bootstrap`, `fig_weighting_comparison`).

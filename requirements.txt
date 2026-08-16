@@ -1,0 +1,9 @@
+# Runtime deps for harmonic_fit.py / harmonic_plots.py / harmonic_pipeline.ipynb
+# (Section 0 of CLAUDE.md) plus vrm/ (Section 9) and notebook execution.
+numpy
+scipy
+astropy
+matplotlib
+nbformat
+nbconvert
+ipykernel
