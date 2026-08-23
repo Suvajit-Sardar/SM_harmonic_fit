@@ -58,11 +58,16 @@ Other TRM models with a results/ring_results.ecsv already fit: {", ".join(m for 
 until it runs on correct inputs):
 
 1. **Inputs.** The original scratch notebook hardcoded a rotation curve and
-   a `V_rad(R)` array that traced to no single TRM run in this repo (one
-   array was even index-shifted by one ring). Every number below now comes
-   from `{trm_dir_name}`'s own ringlog and its own
-   `results/ring_results.ecsv` -- no numeric literal for radius, velocity,
-   PA, inclination, or scale anywhere outside `timescales.Config`.
+   a `V_rad(R)` array as literals rather than reading them from disk. The
+   numbers themselves were not wrong -- they were a valid snapshot of a
+   `{trm_dir_name}` TRM run -- but pinning them as literals meant they went
+   silently stale the moment `{trm_dir_name}`'s TRM outputs were re-run
+   (which is exactly what happened between the original notebook and this
+   refactor). Every number below now comes from `{trm_dir_name}`'s own
+   ringlog and its own `results/ring_results.ecsv` instead -- no numeric
+   literal for radius, velocity, PA, inclination, or scale anywhere outside
+   `timescales.Config` -- so a re-run of the TRM fit can never leave this
+   notebook out of sync again.
 2. **Void geometry.** The void's sky corners are deprojected with
    `harmonic_fit.deproject_pixel_offsets` -- the exact rotation/handedness
    convention `make_geometry` uses internally -- instead of a second,

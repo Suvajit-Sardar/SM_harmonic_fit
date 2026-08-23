@@ -673,10 +673,22 @@ def selftest():
     rv = load_radial_velocities(results_dir, side=cfg.side)
 
     # ---------------- Test: inputs trace to the ringlog, kpc_per_arcsec ----------------
-    check("kpc_per_arcsec derived from ringlog == 0.33890 +/- 1e-4",
-          abs(rc.kpc_per_arcsec - 0.33890) < 1e-4, f"(got {rc.kpc_per_arcsec:.5f})")
-    check("Rotation curve radii/velocities match PA_fixed_to_42.txt (first ring)",
-          np.isclose(rc.radii_kpc[0], 14.234, atol=1e-3) and np.isclose(rc.v_kms[0], 299.404, atol=1e-3),
+    # Self-consistency, not a frozen snapshot: read the raw ringlog table
+    # directly and confirm load_rotation_curve's derived values match
+    # whatever the file currently contains (a re-run of the TRM fit changes
+    # these numbers -- see e.g. fixed_PA42's own revision history -- so
+    # this must never hardcode a specific run's output).
+    raw = read_ringlog(ringlog_path)
+    expected_kpc_per_arcsec = float(raw["r_center_kpc"][0] / (raw["r_in_arcsec"][0] + raw["r_out_arcsec"][0]) * 2.0)
+    # rc.kpc_per_arcsec is the mean across rings (read_ringlog.meta); a single
+    # row's own ratio can differ by up to read_ringlog's own rtol=1e-3
+    # cross-row consistency check, so compare at that tolerance, not exactly.
+    check("kpc_per_arcsec derived from ringlog matches RAD(Kpc)/RAD(arcs) directly",
+          abs(rc.kpc_per_arcsec - expected_kpc_per_arcsec) / expected_kpc_per_arcsec < 1e-3,
+          f"(got {rc.kpc_per_arcsec:.5f}, row0 ratio={expected_kpc_per_arcsec:.5f})")
+    check("Rotation curve radii/velocities (first ring) match the raw ringlog table",
+          np.isclose(rc.radii_kpc[0], float(raw["r_center_kpc"][0]), atol=1e-9)
+          and np.isclose(rc.v_kms[0], float(raw["VROT(km/s)"][0]), atol=1e-9),
           f"(R0={rc.radii_kpc[0]}, V0={rc.v_kms[0]})")
 
     # ---------------- Test: sign flip on read ----------------
