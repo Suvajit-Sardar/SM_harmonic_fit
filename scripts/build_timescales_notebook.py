@@ -73,7 +73,7 @@ until it runs on correct inputs):
    convention `make_geometry` uses internally -- instead of a second,
    independently-defined (and differently-handed) deprojection. The
    resulting radius is checked against the rotation curve's radial coverage
-   before evaluating the spline there.
+   before evaluating the fit there.
 3. **The epicyclic ("kick") fit.** The original three-parameter
    `scipy.optimize.curve_fit` pegged its amplitude at the lower search bound
    -- meaning the quoted `t = 94.5 +/- 338.2 Myr` was never a measurement,
@@ -83,6 +83,16 @@ until it runs on correct inputs):
    points cannot constrain three free parameters). The salvageable physical
    result is an **upper limit on the kick amplitude V0**, not a point
    estimate of `t`.
+
+**Rotation-curve fit.** With only a handful of rings, an *interpolating*
+natural cubic spline is forced exactly through ring-to-ring scatter that is
+well within each ring's own `E_VROT` uncertainty, which shows up as a visible
+hump-and-dip that isn't a real kinematic feature -- worst in the extrapolated
+region the void radius sits in. `timescales.generate_kinematic_curve` fits a
+weighted low-order polynomial instead (`cfg.rotation_curve_poly_order`,
+default 1/linear; weights `1/sigma^2` with `sigma = (E_VROT1+E_VROT2)/2`),
+which stays close to flat where the data support it rather than chasing
+noise.
 
 **Sign convention.** `harmonic_fit.py`'s `s1` keeps the raw fit sign, and
 `CLAUDE.md` 2.6.1 resolves -- for this galaxy, given the near side at
@@ -187,27 +197,30 @@ print(f"\nInteraction timescale (UPPER LIMIT, Sec 3.3.3 caveat) = {void.t_intera
     md(r"""
 ## Figure 1: rotation curve, ring points, and the void's radius
 
-Natural cubic spline through the adopted ringlog's `VROT(R)`; ring points
-with their asymmetric `E_VROT1`/`E_VROT2` error bars; the void's deprojected
-radius marked. The region beyond the ringlog's radial coverage (where
-`dv/dR` -- and therefore `kappa` -- is extrapolated, not measured) is
-shaded.
+Weighted least-squares polynomial fit (order `cfg.rotation_curve_poly_order`,
+default 1/linear, weighted by each ring's `E_VROT1`/`E_VROT2`) through the
+adopted ringlog's `VROT(R)` -- not an interpolating spline, see the "Rotation-
+curve fit" note above; ring points with their asymmetric error bars; the
+void's deprojected radius marked. The region beyond the ringlog's radial
+coverage (where `dv/dR` -- and therefore `kappa` -- is extrapolated, not
+measured) is shaded.
 """)
 
     code(r"""
-def fig_rotation_curve(rc, void):
+def fig_rotation_curve(rc, void, cfg):
     r_min, r_max = rc.radii_kpc.min(), rc.radii_kpc.max()
     r_lo_plot = min(r_min, void.r_avg_kpc) * 0.8
     r_hi_plot = max(r_max, void.r_avg_kpc) * 1.1
     R_grid = np.linspace(r_lo_plot, r_hi_plot, 300)
-    v_grid = rc.spline(R_grid)
+    v_grid = rc.curve(R_grid)
 
     fig, ax = plt.subplots(figsize=(10, 8))
     if r_lo_plot < r_min:
         ax.axvspan(r_lo_plot, r_min, color="0.85", zorder=0, label="extrapolated")
     if r_hi_plot > r_max:
         ax.axvspan(r_max, r_hi_plot, color="0.85", zorder=0)
-    ax.plot(R_grid, v_grid, color="darkred", lw=2, label="Natural cubic spline")
+    ax.plot(R_grid, v_grid, color="darkred", lw=2,
+            label=f"Weighted polynomial fit (order={cfg.rotation_curve_poly_order})")
     ax.errorbar(rc.radii_kpc, rc.v_kms, yerr=[rc.v_err_lo, rc.v_err_hi], fmt="o", color="black",
                 ecolor="gray", capsize=5, elinewidth=1.5, markersize=7, label="TRM (adopted ringlog)")
     ax.plot(void.r_avg_kpc, void.v_c_void_kms, "*", color="blue", markersize=18, label="Void ($R_\\mathrm{avg}$)")
@@ -222,7 +235,7 @@ def fig_rotation_curve(rc, void):
     fig.tight_layout()
     return fig
 
-fig_rotation_curve(rc, void)
+fig_rotation_curve(rc, void, cfg)
 None
 """)
 
@@ -253,7 +266,7 @@ upper limit below, as horizontal reference lines.
     code(r"""
 def fig_clocks(rc, void, cfg):
     R_grid = np.linspace(rc.radii_kpc.min(), rc.radii_kpc.max(), 200)
-    Omega_g, kappa_g = ts.calculate_frequencies(R_grid, rc.spline)
+    Omega_g, kappa_g = ts.calculate_frequencies(R_grid, rc.curve)
     Tphi_g, Tk_g = ts.calculate_timescales(Omega_g, kappa_g)
 
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -356,9 +369,9 @@ def fig_obs_vs_model(rv, rc, grid, ul, cfg):
                 capsize=5, elinewidth=1.5, markersize=8, label="Observed ($-s_1$, outward)", zorder=5)
 
     R_grid = np.linspace(rc.radii_kpc.min(), rc.radii_kpc.max(), 200)
-    model_min = ts.kick_model_v_R(R_grid, grid.t_at_min, grid.V0_at_min, cfg.alpha, rc.spline, cfg.r_ref_kpc)
+    model_min = ts.kick_model_v_R(R_grid, grid.t_at_min, grid.V0_at_min, cfg.alpha, rc.curve, cfg.r_ref_kpc)
     model_ul = ts.kick_model_v_R(R_grid, ul["t_at_tightest_myr"], ul["V0_upper_limit_tightest_kms"],
-                                  cfg.alpha, rc.spline, cfg.r_ref_kpc)
+                                  cfg.alpha, rc.curve, cfg.r_ref_kpc)
     ax.plot(R_grid, model_min, color="darkorange", lw=2,
             label=f"grid min ($V_0$={grid.V0_at_min:.1f}, t={grid.t_at_min:.0f} Myr) -- not a measurement")
     ax.plot(R_grid, model_ul, color="crimson", lw=2, linestyle="--",

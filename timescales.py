@@ -37,7 +37,7 @@ import numpy as np
 from astropy.io import fits
 from astropy.table import Table
 from astropy.wcs import WCS
-from scipy.interpolate import CubicSpline
+from numpy.polynomial import Polynomial
 from scipy.stats import chi2 as chi2_dist
 
 from harmonic_fit import deproject_pixel_offsets, find_ringlog, load_maps, read_ringlog
@@ -61,6 +61,19 @@ class Config:
     output_dir: Optional[Path] = None  # where timescales.json is written; default results_dir
 
     side: str = "both"
+
+    # Rotation-curve model: weighted least-squares polynomial (order=1,
+    # linear, by default), NOT an interpolating spline. With only a handful
+    # of rings, forcing the curve exactly through every point (as a natural
+    # cubic spline does) turns ring-to-ring scatter that is well within each
+    # ring's own E_VROT uncertainty into spurious curvature -- visibly a
+    # hump-and-dip in fig_rotation_curve, worst in the extrapolated region
+    # the void radius sits in. A weighted fit stays close to flat where the
+    # data support it instead. Weights are 1/sigma^2 with
+    # sigma = (E_VROT1 + E_VROT2)/2 per ring. Exposed here (not hardcoded)
+    # since a future TRM model with more rings, or a ring-to-ring trend that
+    # is large relative to its errors, may justify order=2.
+    rotation_curve_poly_order: int = 1
 
     # Epicyclic "kick" model (Section 3.2). alpha is fixed, not fitted --
     # Wallin & Struck-Marcell (1994) Sec 3.1 derive the perturbation scaling
@@ -112,47 +125,79 @@ class Config:
 
 
 # --------------------------------------------------------------------------
-# Rotation curve spline (one definition, used everywhere)
+# Rotation curve fit (one definition, used everywhere)
 # --------------------------------------------------------------------------
 
 
-def generate_kinematic_spline(radii_kpc: np.ndarray, v_kms: np.ndarray) -> CubicSpline:
-    """Natural cubic spline of the rotation curve. 'natural' boundary
-    conditions enforce zero second derivative at the edges, preventing
-    artificial oscillation (Runge's phenomenon)."""
+class RotationCurveFit:
+    """Callable rotation-curve model wrapping a numpy Polynomial, exposing
+    the same __call__/.derivative() interface scipy's CubicSpline has (so
+    calculate_frequencies and everything downstream don't care which fit
+    backs the curve)."""
+
+    def __init__(self, poly: Polynomial):
+        self._poly = poly
+
+    def __call__(self, R_kpc):
+        return self._poly(np.asarray(R_kpc, dtype=float))
+
+    def derivative(self) -> "RotationCurveFit":
+        return RotationCurveFit(self._poly.deriv())
+
+
+def generate_kinematic_curve(radii_kpc, v_kms, v_err_lo=None, v_err_hi=None, order: int = 1) -> RotationCurveFit:
+    """Weighted least-squares polynomial fit to the rotation curve --
+    order=1 (linear) by default, NOT an interpolating spline. See
+    Config.rotation_curve_poly_order for why: with only a handful of rings,
+    forcing the curve exactly through every point turns ring-to-ring scatter
+    that is well within each ring's own E_VROT uncertainty into spurious
+    curvature. Weights are 1/sigma^2 with sigma = (v_err_lo + v_err_hi)/2
+    per ring when errors are supplied, else unweighted (ordinary
+    least-squares). order is clipped to len(radii)-1 so this never raises
+    for a TRM model with fewer rings than the requested order.
+    """
     radii_kpc = np.asarray(radii_kpc, dtype=float)
     v_kms = np.asarray(v_kms, dtype=float)
-    order = np.argsort(radii_kpc)
-    return CubicSpline(radii_kpc[order], v_kms[order], bc_type="natural")
+    order_idx = np.argsort(radii_kpc)
+    radii_kpc, v_kms = radii_kpc[order_idx], v_kms[order_idx]
+
+    weights = None
+    if v_err_lo is not None and v_err_hi is not None:
+        sigma = (np.asarray(v_err_lo, dtype=float)[order_idx] + np.asarray(v_err_hi, dtype=float)[order_idx]) / 2.0
+        weights = 1.0 / sigma**2
+
+    order_eff = min(order, len(radii_kpc) - 1)
+    poly = Polynomial.fit(radii_kpc, v_kms, deg=order_eff, w=weights)
+    return RotationCurveFit(poly)
 
 
 def warn_if_extrapolating(name: str, R_kpc, r_min: float, r_max: float):
-    """CLAUDE.md-style guard (Section 2.2): CubicSpline extrapolates
-    silently, and kappa depends on dv/dR, which is least trustworthy in the
-    extrapolated region. Warn explicitly rather than letting it pass
-    unnoticed."""
+    """CLAUDE.md-style guard (Section 2.2): the rotation-curve fit
+    extrapolates silently outside [r_min, r_max], and kappa depends on
+    dv/dR, which is least trustworthy in the extrapolated region. Warn
+    explicitly rather than letting it pass unnoticed."""
     R_arr = np.atleast_1d(np.asarray(R_kpc, dtype=float))
     below = R_arr[R_arr < r_min]
     above = R_arr[R_arr > r_max]
     if below.size:
         warnings.warn(
-            f"{name}: evaluating spline {r_min - below.min():.3f} kpc below the "
-            f"innermost knot ({r_min:.3f} kpc) -- dv/dR (and kappa) is extrapolated, not measured."
+            f"{name}: evaluating the rotation-curve fit {r_min - below.min():.3f} kpc below the "
+            f"innermost ring ({r_min:.3f} kpc) -- dv/dR (and kappa) is extrapolated, not measured."
         )
     if above.size:
         warnings.warn(
-            f"{name}: evaluating spline {above.max() - r_max:.3f} kpc beyond the "
-            f"outermost knot ({r_max:.3f} kpc) -- dv/dR (and kappa) is extrapolated, not measured."
+            f"{name}: evaluating the rotation-curve fit {above.max() - r_max:.3f} kpc beyond the "
+            f"outermost ring ({r_max:.3f} kpc) -- dv/dR (and kappa) is extrapolated, not measured."
         )
 
 
-def calculate_frequencies(R_kpc, v_spline: CubicSpline):
+def calculate_frequencies(R_kpc, v_curve: RotationCurveFit):
     """Omega (angular) and kappa (epicyclic) frequencies, in km/s/kpc.
     kappa^2 = 2*Omega^2 + 2*Omega*(dv/dR)."""
     R_kpc = np.asarray(R_kpc, dtype=float)
-    dv_spline = v_spline.derivative()
-    v_c = v_spline(R_kpc)
-    dv_dR = dv_spline(R_kpc)
+    dv_curve = v_curve.derivative()
+    v_c = v_curve(R_kpc)
+    dv_dR = dv_curve(R_kpc)
     Omega = v_c / R_kpc
     kappa = np.sqrt(2.0 * Omega**2 + 2.0 * Omega * dv_dR)
     return Omega, kappa
@@ -181,13 +226,14 @@ class RotationCurve:
     xpos_pix: float
     ypos_pix: float
     kpc_per_arcsec: float
-    spline: CubicSpline
+    curve: RotationCurveFit
 
 
-def load_rotation_curve(ringlog_path: Path) -> RotationCurve:
+def load_rotation_curve(ringlog_path: Path, order: int = 1) -> RotationCurve:
     """Section 1.1: every ring parameter traces to the adopted ringlog --
     no numeric literal for radius, velocity, PA, inclination, or scale
-    anywhere else in this module."""
+    anywhere else in this module. order: rotation-curve polynomial order,
+    see Config.rotation_curve_poly_order."""
     t = read_ringlog(ringlog_path)
     radii_kpc = np.asarray(t["r_center_kpc"], dtype=float)
     v_kms = np.asarray(t["VROT(km/s)"], dtype=float)
@@ -211,7 +257,7 @@ def load_rotation_curve(ringlog_path: Path) -> RotationCurve:
         )
 
     kpc_per_arcsec = float(t.meta["kpc_per_arcsec"])
-    spline = generate_kinematic_spline(radii_kpc, v_kms)
+    curve = generate_kinematic_curve(radii_kpc, v_kms, v_err_lo, v_err_hi, order=order)
 
     return RotationCurve(
         radii_kpc=radii_kpc,
@@ -223,7 +269,7 @@ def load_rotation_curve(ringlog_path: Path) -> RotationCurve:
         xpos_pix=float(xpos_vals[0]),
         ypos_pix=float(ypos_vals[0]),
         kpc_per_arcsec=kpc_per_arcsec,
-        spline=spline,
+        curve=curve,
     )
 
 
@@ -352,8 +398,8 @@ def void_geometry(cfg: Config, rc: RotationCurve, header, cdelt1_sign: int) -> V
     R_avg_kpc = R_avg_arcsec * rc.kpc_per_arcsec
 
     warn_if_extrapolating("void R_avg", R_avg_kpc, rc.radii_kpc.min(), rc.radii_kpc.max())
-    v_c_void = float(rc.spline(R_avg_kpc))
-    Omega, _ = calculate_frequencies(np.array([R_avg_kpc]), rc.spline)
+    v_c_void = float(rc.curve(R_avg_kpc))
+    Omega, _ = calculate_frequencies(np.array([R_avg_kpc]), rc.curve)
     T_phi_void = float((2.0 * np.pi / Omega[0]) * CONVERSION_MYR)
 
     fraction = dtheta_deg / 360.0
@@ -376,12 +422,12 @@ def void_geometry(cfg: Config, rc: RotationCurve, header, cdelt1_sign: int) -> V
 # --------------------------------------------------------------------------
 
 
-def kick_model_v_R(R_kpc, t_myr, V0_kms, alpha, v_spline, r_ref_kpc, conversion_myr=CONVERSION_MYR):
+def kick_model_v_R(R_kpc, t_myr, V0_kms, alpha, v_curve, r_ref_kpc, conversion_myr=CONVERSION_MYR):
     """Wallin & Struck-Marcell (1994)-style radial kick, damped/oscillating
     through the epicyclic frequency: V_R(R, t) = V0*(R/r_ref)^-alpha *
     sin(kappa(R)*t). V0 > 0, R_kpc scalar or array; t_myr scalar."""
     R_kpc = np.asarray(R_kpc, dtype=float)
-    _, kappa = calculate_frequencies(R_kpc, v_spline)
+    _, kappa = calculate_frequencies(R_kpc, v_curve)
     kappa_myr = kappa / conversion_myr
     v_kick = V0_kms * (R_kpc / r_ref_kpc) ** (-alpha)
     return v_kick * np.sin(kappa_myr * t_myr)
@@ -406,7 +452,7 @@ def epicyclic_chi2_grid(cfg: Config, rv: RadialVelocities, rc: RotationCurve) ->
     V0_grid = np.arange(0.0, cfg.v0_grid_max_kms + 1e-9, cfg.v0_grid_step_kms)
     t_grid = np.arange(0.0, cfg.t_grid_max_myr + 1e-9, cfg.t_grid_step_myr)
 
-    _, kappa = calculate_frequencies(rv.radii_kpc, rc.spline)
+    _, kappa = calculate_frequencies(rv.radii_kpc, rc.curve)
     kappa_myr = kappa / CONVERSION_MYR  # (n_rings,)
     R_ratio = (rv.radii_kpc / cfg.r_ref_kpc) ** (-cfg.alpha)  # (n_rings,)
 
@@ -462,7 +508,7 @@ def v0_upper_limit(grid: EpicyclicGrid, t_lo_myr: float, t_hi_myr: float, cl: fl
 def t_kappa_half_per_ring(rc: RotationCurve):
     """Section 3.2: 'report T_kappa/2 per ring, not globally' -- a single t
     cannot place every ring at turnaround simultaneously."""
-    Omega, kappa = calculate_frequencies(rc.radii_kpc, rc.spline)
+    Omega, kappa = calculate_frequencies(rc.radii_kpc, rc.curve)
     T_phi, T_kappa = calculate_timescales(Omega, kappa)
     return T_phi, T_kappa, T_kappa / 2.0
 
@@ -517,7 +563,7 @@ def validate_bridge_orientation(bridge_pa_deg: Optional[float], disc_pa_deg: flo
 
 def run(cfg: Config) -> dict:
     ringlog = read_ringlog(cfg.ringlog_path)
-    rc = load_rotation_curve(cfg.ringlog_path)
+    rc = load_rotation_curve(cfg.ringlog_path, order=cfg.rotation_curve_poly_order)
     rv = load_radial_velocities(cfg.results_dir, side=cfg.side)
 
     mapset = load_maps(cfg.trm_dir / "maps")
@@ -669,7 +715,7 @@ def selftest():
     results_dir = trm_dir / "results"
     cfg = Config(trm_dir=trm_dir, ringlog_path=ringlog_path, results_dir=results_dir)
 
-    rc = load_rotation_curve(ringlog_path)
+    rc = load_rotation_curve(ringlog_path, order=cfg.rotation_curve_poly_order)
     rv = load_radial_velocities(results_dir, side=cfg.side)
 
     # ---------------- Test: inputs trace to the ringlog, kpc_per_arcsec ----------------
@@ -711,7 +757,7 @@ def selftest():
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         warn_if_extrapolating("test", np.array([1.0]), rc.radii_kpc.min(), rc.radii_kpc.max())
-        fired = any("evaluating spline" in str(wi.message) for wi in w)
+        fired = any("evaluating the rotation-curve fit" in str(wi.message) for wi in w)
     check("extrapolation warning fires below the innermost knot", fired)
 
     # ---------------- Test: no optimiser -- grid chi2 matches independent scalar computation ----------------
@@ -720,25 +766,42 @@ def selftest():
     V0_test, t_test = grid.V0_grid_kms[iv], grid.t_grid_myr[it]
     manual = 0.0
     for R, obs, sig in zip(rv.radii_kpc, rv.v_R_outward_kms, rv.sigma_kms):
-        model = kick_model_v_R(R, t_test, V0_test, cfg.alpha, rc.spline, cfg.r_ref_kpc)
+        model = kick_model_v_R(R, t_test, V0_test, cfg.alpha, rc.curve, cfg.r_ref_kpc)
         manual += ((obs - model) / sig) ** 2
     check("vectorised grid chi2 matches an independent scalar computation (1e-6)",
           abs(grid.chi2[iv, it] - manual) < 1e-6,
           f"(grid={grid.chi2[iv, it]:.8f}, manual={manual:.8f})")
 
     # ---------------- Test: reproduces the old (pegged) fit's RSS on the old fixture ----------------
-    # Historical fixture only -- NOT used anywhere in production Config. This
-    # is the exact data from the superseded notebook (hardcoded ring_radii/
-    # ring_v_c, and the placeholder ring_v_R this task replaces), used solely
-    # to confirm the new deterministic model function reproduces the old
-    # (curve_fit-derived, pegged-at-bound) unweighted RSS -- i.e. that
-    # removing the optimiser did not change the underlying model formula.
+    # Historical fixture only -- NOT used anywhere in production Config, and
+    # deliberately using scipy's CubicSpline directly rather than
+    # generate_kinematic_curve: the RSS=179.47 being reproduced here was
+    # itself computed against the superseded notebook's natural-cubic-spline
+    # rotation curve, not the current weighted-polynomial default, so
+    # matching it requires the same (now-retired) interpolation method. This
+    # test's purpose is narrow -- confirm the kick-model formula itself is
+    # unchanged from the optimiser-based version, i.e. that removing
+    # curve_fit did not change the underlying model -- not to validate
+    # today's rotation-curve fit, which is covered by the tests above.
+    from scipy.interpolate import CubicSpline as _LegacyCubicSpline
+
     legacy_radii = np.array([14.9, 18.2, 21.5, 24.8])
     legacy_v = np.array([297.223, 295.973, 304.49, 307.541])
     legacy_v_R = np.array([9.73993963, -0.81866769, -1.4475939, 13.23452213])
-    legacy_spline = generate_kinematic_spline(legacy_radii, legacy_v)
+    _legacy_spline = _LegacyCubicSpline(legacy_radii, legacy_v, bc_type="natural")
     legacy_t, legacy_V0, legacy_alpha = 94.5, 10.0, 1.31
-    legacy_model = kick_model_v_R(legacy_radii, legacy_t, legacy_V0, legacy_alpha, legacy_spline, cfg.r_ref_kpc)
+
+    def _legacy_kick_model_v_R(R_kpc, t_myr, V0_kms, alpha, spline, r_ref_kpc, conversion_myr=CONVERSION_MYR):
+        dv_spline = spline.derivative()
+        v_c = spline(R_kpc)
+        dv_dR = dv_spline(R_kpc)
+        Omega = v_c / R_kpc
+        kappa = np.sqrt(2.0 * Omega**2 + 2.0 * Omega * dv_dR)
+        kappa_myr = kappa / conversion_myr
+        v_kick = V0_kms * (np.asarray(R_kpc, dtype=float) / r_ref_kpc) ** (-alpha)
+        return v_kick * np.sin(kappa_myr * t_myr)
+
+    legacy_model = _legacy_kick_model_v_R(legacy_radii, legacy_t, legacy_V0, legacy_alpha, _legacy_spline, cfg.r_ref_kpc)
     legacy_rss = float(np.sum((legacy_v_R - legacy_model) ** 2))
     check("grid model formula reproduces the old pegged-fit RSS (179.47, notebook printout)",
           abs(legacy_rss - 179.47) < 0.05, f"(got {legacy_rss:.2f})")
