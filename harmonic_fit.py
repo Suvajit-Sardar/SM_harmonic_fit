@@ -315,11 +315,14 @@ def load_maps(maps_dir: Path) -> MapSet:
 # --------------------------------------------------------------------------
 
 
-def make_geometry(shape, xc, yc, pa_barolo_deg, inc_deg, cdelt1_sign):
-    """Pure function, no globals, no I/O. Returns (R_pix, theta_rad).
-
-    theta = 0 on the receding major axis, theta = 180 deg on the approaching
-    side, theta = +/-90 deg on the minor axis (max V_rad leverage).
+def deproject_pixel_offsets(dx, dy, pa_barolo_deg, inc_deg, cdelt1_sign):
+    """Core deprojection algebra (CLAUDE.md 2.1-2.2), factored out of
+    make_geometry so callers with a point (or a handful of points) rather
+    than a full image grid -- e.g. timescales.py's void geometry -- can
+    reuse the exact same rotation/deprojection instead of maintaining a
+    second implementation. dx, dy: pixel offsets from the galaxy center
+    (same convention as make_geometry: dx = x - xc, dy = y - yc), scalar or
+    array. Returns (R_pix, theta_rad).
     """
     if cdelt1_sign < 0:
         pa_math_deg = pa_barolo_deg + 90.0
@@ -336,9 +339,8 @@ def make_geometry(shape, xc, yc, pa_barolo_deg, inc_deg, cdelt1_sign):
     pa_rad = np.radians(pa_math_deg)
     inc_rad = np.radians(inc_deg)
 
-    y_idx, x_idx = np.indices(shape)
-    dx = x_idx - xc
-    dy = y_idx - yc
+    dx = np.asarray(dx, dtype=float)
+    dy = np.asarray(dy, dtype=float)
 
     dx_rot = dx * np.cos(pa_rad) + dy * np.sin(pa_rad)
     dy_rot = -dx * np.sin(pa_rad) + dy * np.cos(pa_rad)
@@ -347,6 +349,18 @@ def make_geometry(shape, xc, yc, pa_barolo_deg, inc_deg, cdelt1_sign):
     R_pix = np.hypot(dx_rot, dy_deproj)
     theta_rad = np.arctan2(dy_deproj, dx_rot)
     return R_pix, theta_rad
+
+
+def make_geometry(shape, xc, yc, pa_barolo_deg, inc_deg, cdelt1_sign):
+    """Pure function, no globals, no I/O. Returns (R_pix, theta_rad).
+
+    theta = 0 on the receding major axis, theta = 180 deg on the approaching
+    side, theta = +/-90 deg on the minor axis (max V_rad leverage).
+    """
+    y_idx, x_idx = np.indices(shape)
+    dx = x_idx - xc
+    dy = y_idx - yc
+    return deproject_pixel_offsets(dx, dy, pa_barolo_deg, inc_deg, cdelt1_sign)
 
 
 def ring_mask(R_arcsec, r_in, r_out, mom1, mom2):
