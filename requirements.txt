@@ -7,3 +7,11 @@ matplotlib
 nbformat
 nbconvert
 ipykernel
+
+# timescales.py: NFW potential (galpy.potential.NFWPotential) and the pair
+# radial-orbit integration (galpy.orbit.Orbit), Section 0 of the timescales spec.
+galpy
+
+# timescales_pipeline_<model>.ipynb: renders the Table 2 summary as a
+# DataFrame (the notebook's own copy-paste-into-the-paper table).
+pandas
