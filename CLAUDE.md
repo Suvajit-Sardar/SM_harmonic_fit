@@ -283,15 +283,37 @@ convention is still visible downstream even though it is no longer a choice.
 Derive ring width from `np.diff(RAD)` rather than hardcoding 9.7, and assert
 uniform spacing.
 
-Also derive `kpc_per_arcsec` from `RAD(Kpc) / RAD(arcs)` (≈ 0.33888) instead of
-the stale 0.329 in the old script. Assert consistency across rows.
+**`kpc_per_arcsec` is an adopted physical constant, not derived from the
+ringlog.** An earlier version of this section said to derive it from
+`RAD(Kpc) / RAD(arcs)` (≈ 0.33888) instead of the old script's hardcoded
+0.329 — that guidance is now reversed. Barolo's `RAD(Kpc)` column bakes in
+whatever cosmology/distance Barolo itself assumed internally, which is
+unknown and need not match the project's adopted cosmology. `harmonic_fit.
+KPC_PER_ARCSEC` instead **computes** the scale from Planck18
+(`astropy.cosmology.Planck18`) at the source's redshift
+(`z = VSYS_FOR_DISTANCE_KMS / c`, the low-z/optical convention, anchored to
+`TRM_paper`'s own Barolo VSYS — 4677.0 km/s — so the scale doesn't drift by
+run-to-run VSYS fit noise between TRM models): `kpc_per_arcsec =
+D_A(z) * (1 arcsec in radians)`, which evaluates to ≈ 0.3288 kpc/arcsec —
+matching the ≈ 0.329 the old script hardcoded, but now for a documented,
+citable reason rather than as an unexplained literal. `read_ringlog` still
+reads `RAD(Kpc)` and checks Barolo's own implied `RAD(Kpc)/RAD(arcs)` for
+internal row-to-row consistency (a QA check on Barolo's file, independent
+of which absolute scale is adopted) and warns if it diverges from the
+adopted value by more than 1% (it does, by ~3%, for both `TRM_paper` and
+`fixed_PA42`) — but Barolo's value is never used for any kpc conversion.
+`r_center_kpc` (used everywhere downstream, including all of
+`timescales.py`) is `RAD(arcs) * KPC_PER_ARCSEC`, not `RAD(Kpc)`.
 
 ---
 
 ## 4. Values that must come from the ringlog, never hardcoded
 
 `VROT`, `DISP`, `INC`, `P.A.`, `XPOS`, `YPOS`, `VSYS`, `VRAD`, `E_VROT1/2`,
-ring radii, and `kpc_per_arcsec`.
+and ring radii (angular: `RAD(arcs)`, `r_in_arcsec`, `r_out_arcsec`).
+`kpc_per_arcsec` is the one exception — see Section 3: it is an adopted
+Planck18-cosmology constant (`harmonic_fit.KPC_PER_ARCSEC`), not read from
+the ringlog.
 
 The old script's hardcoded values disagree with this file (`VSYS` 4676 vs 4677,
 `INC` 49 vs 49.345, `PA` 53 vs 53.445, and all four `VROT` values differ), which
@@ -326,6 +348,7 @@ project_dir, maps_dir, ringlog_path, results_dir
     # project_dir is a TRM model directory (Section 1), not the repo root --
     # maps_dir/ringlog_path/results_dir default to <project_dir>/maps,
     # find_ringlog(project_dir), and <project_dir>/results respectively.
+kpc_per_arcsec          : 0.329 (computed, Planck18 -- see Section 3, not read from the ringlog)
 weighting_schemes       : ("uniform", "sin2", "invvar")
 primary_weighting       : "sin2"
 model_terms             : ("c0", "s1")                 # c1 always fixed
@@ -345,8 +368,10 @@ No science constant may appear anywhere else in either file.
 
 ### 5.2 I/O
 
-- `read_ringlog(path) -> astropy.table.Table` — whitespace-delimited, `#`-comment
-  header. Attach ring edges as `RAD ± width/2` (`RAD` is the ring center).
+- `read_ringlog(path, kpc_per_arcsec=KPC_PER_ARCSEC) -> astropy.table.Table` —
+  whitespace-delimited, `#`-comment header. Attach ring edges as `RAD ± width/2`
+  (`RAD` is the ring center). `r_center_kpc = RAD(arcs) * kpc_per_arcsec`
+  (Section 3), not Barolo's own `RAD(Kpc)`.
 - `load_maps(maps_dir) -> MapSet` — data mom1/mom2 and model mom1/mom2, squeezed
   to 2D. **Read `BUNIT` from each header and assert it is `KM/S` or `M/S` — raise
   on anything else.** For this dataset all four velocity maps (`_1mom`, `_2mom`,
@@ -844,7 +869,9 @@ maps before cells below `min_points` were explicitly excluded.
 
 - Do not apply `np.abs` to `s1` anywhere.
 - Do not use `curve_fit` or any optimiser.
-- Do not hardcode `VSYS`, `INC`, `PA`, `VROT`, ring radii, or `kpc_per_arcsec`.
+- Do not hardcode `VSYS`, `INC`, `PA`, `VROT`, or ring radii — read them from
+  the ringlog. (`kpc_per_arcsec` is deliberately the exception: an adopted
+  Planck18-cosmology constant, Section 3, not read from the ringlog.)
 - Do not reintroduce the `mom2 >= 5.0` pixel cut.
 - Do not call `warnings.filterwarnings` at module scope.
 - Do not plot a Barolo `VRAD` comparison series — it is fixed at zero.

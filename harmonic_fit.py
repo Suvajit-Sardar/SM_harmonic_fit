@@ -25,8 +25,42 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+import astropy.units as u
+from astropy.constants import c as SPEED_OF_LIGHT
+from astropy.cosmology import Planck18
 from astropy.io import fits
 from astropy.table import Table
+
+# Adopted physical scale: computed from Planck18 cosmology at the source's
+# distance, NOT derived from Barolo's own RAD(Kpc) column -- Barolo's
+# internal cosmology/distance assumption is unknown and need not match
+# Planck18. Used for every kpc conversion across this project
+# (harmonic_fit.py, timescales.py) so every TRM model of this one galaxy
+# shares exactly one physical scale. See CLAUDE.md Section 3. This
+# superseded an earlier version of this pipeline that derived
+# kpc_per_arcsec from RAD(Kpc)/RAD(arcs) instead; that ratio is still
+# checked (read_ringlog) as a diagnostic against this value, never used to
+# compute it.
+#
+# VSYS_FOR_DISTANCE_KMS anchors the redshift to TRM_paper's own Barolo VSYS
+# (the run used in the paper, CLAUDE.md Section 1) rather than each TRM
+# model's own (very slightly different -- ~0.05%, fit noise, not a real
+# distance difference) VSYS, so the scale does not drift between TRM models
+# of the same galaxy. z = VSYS/c is the low-z (optical) convention, matching
+# how Barolo's own VSYS is quoted; at z ~ 0.0156 the relativistic correction
+# is far below the precision this scale is used at.
+VSYS_FOR_DISTANCE_KMS = 4677.0
+
+
+def _compute_kpc_per_arcsec(vsys_kms: float, cosmology=Planck18) -> float:
+    """kpc_per_arcsec = D_A(z) * (1 arcsec in radians), D_A the angular-
+    diameter distance at z = vsys_kms/c under the given cosmology."""
+    z = vsys_kms / SPEED_OF_LIGHT.to(u.km / u.s).value
+    D_A = cosmology.angular_diameter_distance(z)
+    return float((D_A.to(u.kpc) * (1.0 * u.arcsec).to(u.rad).value).value)
+
+
+KPC_PER_ARCSEC = _compute_kpc_per_arcsec(VSYS_FOR_DISTANCE_KMS)  # ~0.3288 kpc/arcsec (Planck18)
 
 # --------------------------------------------------------------------------
 # 5.1 Config
@@ -45,6 +79,12 @@ class Config:
     maps_dir: Path
     ringlog_path: Path
     results_dir: Path
+
+    # Adopted physical scale (Planck18 cosmology at the source distance) --
+    # used for every kpc conversion (r_center_kpc, and everything downstream
+    # in timescales.py); deliberately NOT Barolo's own RAD(Kpc) column. See
+    # KPC_PER_ARCSEC's module-level docstring and CLAUDE.md Section 3.
+    kpc_per_arcsec: float = KPC_PER_ARCSEC
 
     weighting_schemes: tuple = ("uniform", "sin2", "invvar")
     primary_weighting: str = "sin2"
@@ -162,30 +202,53 @@ def discover_trm_models(root_dir: Path) -> dict:
     return models
 
 
-def read_ringlog(path: Path) -> Table:
+def read_ringlog(path: Path, kpc_per_arcsec: float = KPC_PER_ARCSEC) -> Table:
     """Whitespace-delimited, '#'-comment header. Ring edges are attached as
     RAD +/- width/2 -- RAD is the ring center (confirmed by the project owner,
-    reproduces the ring bounds of the previous script exactly)."""
+    reproduces the ring bounds of the previous script exactly).
+
+    kpc_per_arcsec is the ADOPTED physical scale (Planck18 cosmology at the
+    source distance, KPC_PER_ARCSEC by default) -- ring radii in kpc
+    (r_center_kpc, and everything downstream) are computed as
+    RAD(arcs) * kpc_per_arcsec here, NOT read from the ringlog's own
+    RAD(Kpc) column. Barolo's internal cosmology/distance assumption is
+    unknown and need not match Planck18; its own implied kpc_per_arcsec
+    (RAD(Kpc)/RAD(arcs)) is still checked for INTERNAL self-consistency
+    across rows (a QA check on Barolo's file, independent of which absolute
+    scale we adopt) and compared against the adopted value with a warning if
+    they diverge by more than 1% -- but the adopted value is always what's
+    used, for consistency across every TRM model."""
     t = Table.read(str(path), format="ascii.commented_header")
 
     rad_arcs = np.asarray(t["RAD(arcs)"], dtype=float)
-    rad_kpc = np.asarray(t["RAD(Kpc)"], dtype=float)
+    rad_kpc_barolo = np.asarray(t["RAD(Kpc)"], dtype=float)
 
     diffs = np.diff(rad_arcs)
     if not np.allclose(diffs, diffs[0], rtol=1e-6):
         raise RuntimeError(f"Ring radii are not uniformly spaced: diffs = {diffs}")
     width = diffs[0]
 
-    kpc_per_arcsec = rad_kpc / rad_arcs
-    if not np.allclose(kpc_per_arcsec, kpc_per_arcsec[0], rtol=1e-3):
-        raise RuntimeError(f"kpc_per_arcsec is inconsistent across rows: {kpc_per_arcsec}")
+    kpc_per_arcsec_barolo = rad_kpc_barolo / rad_arcs
+    if not np.allclose(kpc_per_arcsec_barolo, kpc_per_arcsec_barolo[0], rtol=1e-3):
+        raise RuntimeError(f"Barolo's own kpc_per_arcsec (RAD(Kpc)/RAD(arcs)) is inconsistent across rows: {kpc_per_arcsec_barolo}")
+    barolo_scale = float(np.mean(kpc_per_arcsec_barolo))
+    rel_diff = abs(barolo_scale - kpc_per_arcsec) / kpc_per_arcsec
+    if rel_diff > 0.01:
+        warnings.warn(
+            f"{Path(path).name}: Barolo's own RAD(Kpc)/RAD(arcs) implies kpc_per_arcsec={barolo_scale:.5f}, "
+            f"which differs from the adopted (Planck18, source-distance) value {kpc_per_arcsec:.5f} by "
+            f"{rel_diff:.1%}. Barolo's internal cosmology/distance assumption is unknown; the adopted value "
+            "is used for every kpc conversion in this project regardless -- see CLAUDE.md Section 3."
+        )
 
     t["r_in_arcsec"] = rad_arcs - width / 2.0
     t["r_out_arcsec"] = rad_arcs + width / 2.0
-    t["r_center_kpc"] = rad_kpc
-    t["kpc_per_arcsec"] = kpc_per_arcsec
+    t["r_center_kpc"] = rad_arcs * kpc_per_arcsec
+    t["r_center_kpc_barolo"] = rad_kpc_barolo  # Barolo's own value -- reference/comparison only, never used downstream
+    t["kpc_per_arcsec"] = np.full_like(rad_arcs, kpc_per_arcsec)
     t.meta["ring_width_arcsec"] = float(width)
-    t.meta["kpc_per_arcsec"] = float(np.mean(kpc_per_arcsec))
+    t.meta["kpc_per_arcsec"] = float(kpc_per_arcsec)
+    t.meta["kpc_per_arcsec_barolo"] = barolo_scale
     t.meta["rad_convention"] = "RAD = ring center"
     return t
 
@@ -812,12 +875,13 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng, ppb):
 
 def main(cfg: Config):
     print(f"[harmonic_fit] RAD convention: ring center (RAD +/- width/2)")
-    ringlog = read_ringlog(cfg.ringlog_path)
+    ringlog = read_ringlog(cfg.ringlog_path, cfg.kpc_per_arcsec)
     print(f"[harmonic_fit] Ring bounds (arcsec):")
     for row in ringlog:
         print(f"    ring: {row['r_in_arcsec']:.2f} -- {row['r_out_arcsec']:.2f}  "
               f"(VROT={row['VROT(km/s)']:.1f} km/s, INC={row['INC(deg)']:.2f} deg, PA={row['P.A.(deg)']:.2f} deg)")
-    print(f"[harmonic_fit] kpc_per_arcsec = {ringlog.meta['kpc_per_arcsec']:.5f}")
+    print(f"[harmonic_fit] kpc_per_arcsec = {ringlog.meta['kpc_per_arcsec']:.5f} (adopted, Planck18) "
+          f"vs. Barolo's own RAD(Kpc)/RAD(arcs) = {ringlog.meta['kpc_per_arcsec_barolo']:.5f}")
 
     mapset = load_maps(cfg.maps_dir)
     cdelt1_sign = -1 if mapset.cdelt1_deg < 0 else (1 if mapset.cdelt1_deg > 0 else 0)
