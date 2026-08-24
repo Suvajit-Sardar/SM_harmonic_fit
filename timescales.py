@@ -55,7 +55,9 @@ from galpy.potential import NFWPotential
 from galpy.potential import evaluatePotentials
 from galpy.potential import vesc as galpy_vesc
 
-from harmonic_fit import deproject_pixel_offsets, find_ringlog, load_maps, make_geometry, pa_degeneracy_slope, read_ringlog
+from harmonic_fit import (
+    KPC_PER_ARCSEC, deproject_pixel_offsets, find_ringlog, load_maps, make_geometry, pa_degeneracy_slope, read_ringlog,
+)
 
 # 1 km/s/kpc = 1 / CONVERSION_MYR Myr^-1 (unit conversion, not a free science
 # constant -- kept centralised so it never needs to be re-derived by hand).
@@ -76,6 +78,13 @@ class Config:
     output_dir: Optional[Path] = None  # where timescales.json is written; default results_dir
 
     side: str = "both"
+
+    # Adopted physical scale (Planck18 cosmology at the source distance,
+    # harmonic_fit.KPC_PER_ARCSEC by default) -- used for every kpc
+    # conversion in this module (R_ring, void, ring turnaround, disk shear,
+    # ...), deliberately NOT Barolo's own RAD(Kpc) column. See
+    # harmonic_fit.KPC_PER_ARCSEC's docstring and CLAUDE.md Section 3.
+    kpc_per_arcsec: float = KPC_PER_ARCSEC
 
     # Rotation-curve model: weighted least-squares polynomial (order=1,
     # linear, by default), NOT an interpolating spline -- see
@@ -276,11 +285,12 @@ class RotationCurve:
     curve: RotationCurveFit
 
 
-def load_rotation_curve(ringlog_path: Path, order: int = 1) -> RotationCurve:
+def load_rotation_curve(ringlog_path: Path, order: int = 1, kpc_per_arcsec: float = KPC_PER_ARCSEC) -> RotationCurve:
     """Every ring parameter traces to the adopted ringlog -- no numeric
     literal for radius, velocity, PA, inclination, or scale anywhere else in
-    this module."""
-    t = read_ringlog(ringlog_path)
+    this module. kpc_per_arcsec is the adopted Planck18-cosmology scale
+    (harmonic_fit.KPC_PER_ARCSEC by default) -- see read_ringlog."""
+    t = read_ringlog(ringlog_path, kpc_per_arcsec)
     radii_kpc = np.asarray(t["r_center_kpc"], dtype=float)
     v_kms = np.asarray(t["VROT(km/s)"], dtype=float)
     # E_VROT1/2 are signed offsets from Barolo (can be negative for the
@@ -1284,8 +1294,8 @@ def _adopted_age_range(quantities: dict):
 
 
 def run(cfg: Config) -> dict:
-    ringlog = read_ringlog(cfg.ringlog_path)
-    rc = load_rotation_curve(cfg.ringlog_path, order=cfg.rotation_curve_poly_order)
+    ringlog = read_ringlog(cfg.ringlog_path, cfg.kpc_per_arcsec)
+    rc = load_rotation_curve(cfg.ringlog_path, order=cfg.rotation_curve_poly_order, kpc_per_arcsec=cfg.kpc_per_arcsec)
     rv = load_radial_velocities(cfg.results_dir, side=cfg.side)
 
     mapset = load_maps(cfg.trm_dir / "maps")
@@ -1591,15 +1601,23 @@ def selftest():
     results_dir = trm_dir / "results"
     cfg = Config(trm_dir=trm_dir, ringlog_path=ringlog_path, results_dir=results_dir)
 
-    rc = load_rotation_curve(ringlog_path, order=cfg.rotation_curve_poly_order)
+    rc = load_rotation_curve(ringlog_path, order=cfg.rotation_curve_poly_order, kpc_per_arcsec=cfg.kpc_per_arcsec)
     rv = load_radial_velocities(results_dir, side=cfg.side)
 
-    # ---------------- Test: inputs trace to the ringlog, kpc_per_arcsec ----------------
-    raw = read_ringlog(ringlog_path)
-    expected_kpc_per_arcsec = float(raw["r_center_kpc"][0] / (raw["r_in_arcsec"][0] + raw["r_out_arcsec"][0]) * 2.0)
-    check("kpc_per_arcsec derived from ringlog matches RAD(Kpc)/RAD(arcs) directly",
-          abs(rc.kpc_per_arcsec - expected_kpc_per_arcsec) / expected_kpc_per_arcsec < 1e-3,
-          f"(got {rc.kpc_per_arcsec:.5f}, row0 ratio={expected_kpc_per_arcsec:.5f})")
+    # ---------------- Test: kpc_per_arcsec is the adopted Planck18 scale, NOT Barolo's own ----------------
+    raw = read_ringlog(ringlog_path, cfg.kpc_per_arcsec)
+    check("rc.kpc_per_arcsec equals cfg.kpc_per_arcsec (the adopted scale, threaded through Config)",
+          np.isclose(rc.kpc_per_arcsec, cfg.kpc_per_arcsec, rtol=1e-12),
+          f"(rc={rc.kpc_per_arcsec:.6f}, cfg={cfg.kpc_per_arcsec:.6f})")
+    check("kpc_per_arcsec derived from Planck18 cosmology at VSYS_FOR_DISTANCE_KMS is ~0.329",
+          abs(KPC_PER_ARCSEC - 0.329) < 0.002,
+          f"(got {KPC_PER_ARCSEC:.5f})")
+    check("adopted kpc_per_arcsec is deliberately NOT Barolo's own RAD(Kpc)/RAD(arcs)",
+          abs(raw.meta["kpc_per_arcsec"] - raw.meta["kpc_per_arcsec_barolo"]) / raw.meta["kpc_per_arcsec_barolo"] > 0.01,
+          f"(adopted={raw.meta['kpc_per_arcsec']:.5f}, Barolo's own={raw.meta['kpc_per_arcsec_barolo']:.5f})")
+    check("r_center_kpc is RAD(arcs)*adopted kpc_per_arcsec, not the ringlog's own RAD(Kpc) column",
+          np.isclose(float(raw["r_center_kpc"][0]), float(raw["RAD(arcs)"][0]) * cfg.kpc_per_arcsec, rtol=1e-9),
+          f"(r_center_kpc[0]={raw['r_center_kpc'][0]:.5f}, RAD(Kpc)[0] (Barolo, unused)={raw['r_center_kpc_barolo'][0]:.5f})")
     check("Rotation curve radii/velocities (first ring) match the raw ringlog table",
           np.isclose(rc.radii_kpc[0], float(raw["r_center_kpc"][0]), atol=1e-9)
           and np.isclose(rc.v_kms[0], float(raw["VROT(km/s)"][0]), atol=1e-9),
