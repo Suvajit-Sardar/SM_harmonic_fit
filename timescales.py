@@ -1,28 +1,35 @@
-"""Epicyclic timescales for the observed HI void (and, if configured, the
-tidal bridge) in the adopted TRM model.
-
-Companion, additive analysis alongside harmonic_fit.py / harmonic_plots.py --
-not one of the CLAUDE.md Section 0 deliverables and does not change any of
-its rules. Reads:
+"""Every dynamical/interaction timescale quoted in the paper, consolidated
+into one module. Companion, additive analysis alongside harmonic_fit.py /
+harmonic_plots.py -- not one of CLAUDE.md's Section 0 deliverables and does
+not change any of its rules. Reads:
 
   - the adopted TRM ringlog (rotation curve: RAD(Kpc), VROT, E_VROT1/2,
     INC(deg), P.A.(deg), XPOS(pix), YPOS(pix));
   - <trm_dir>/results/ring_results.ecsv, written by harmonic_fit.py, for the
-    measured radial velocity s1(R) (side="both", primary weighting) and its
-    bootstrap 16/84 percentiles;
-  - the data moment-1 FITS header, for the WCS needed to place the void's
-    RA/Dec corner coordinates in the same pixel frame as the ringlog's XPOS/
-    YPOS.
+    measured radial velocity s1(R) (side="both", primary weighting), its
+    bootstrap 16/84 percentiles, and (Section 2.8) its PA-scan chi2 curve
+    from <trm_dir>/results/scans.npz;
+  - the data moment-0/moment-1 FITS headers/data, for the WCS needed to
+    place the void's RA/Dec corner coordinates (Section 2.3) and to measure
+    the HI surface-density profile (Section 1).
 
-All computation lives here -- no matplotlib import. See the generated
-notebook for figures.
+All computation lives here -- no matplotlib import. See
+scripts/build_timescales_notebook.py for figures; nothing may be quoted in
+the manuscript that is not computed in this module.
 
-Method: Wallin & Struck-Marcell (1994), ApJ, 430, 121. Sec 3.1 gives the
-perturbation-amplitude scaling used for the "kick" model's alpha (not a free
-parameter -- see EpicyclicConfig.alpha). Sec 3.3.3 notes the perturbed hole
-continues to expand after formation, which is why the void-derived
-interaction timescale here is reported as an upper limit (see
-void_interaction_timescale).
+Nothing here duplicates a deprojection or an NFW potential: geometry always
+goes through harmonic_fit.make_geometry / deproject_pixel_offsets, and every
+potential/enclosed-mass/escape-velocity evaluation goes through the ONE
+galpy.potential.NFWPotential built by build_nfw_potential().
+
+Method citations:
+  - Wallin & Struck-Marcell (1994), ApJ, 430, 121. Sec 3.1: the epicyclic
+    "kick" model's amplitude scaling (Section 3 below, used as the
+    two-parameter alternative to the null in Section 2.8's exclusion test).
+    Sec 3.3.3: the perturbed hole continues to expand after formation, so
+    the void-derived interaction timescale (Section 2.3) is an upper limit.
+    Sec 4.2 and Table 1: the eps=R_ring identification (Section 2.9) and the
+    r_peri=12 kpc "half a disk radius" impact (Section 2.6).
 """
 
 from __future__ import annotations
@@ -34,13 +41,21 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import astropy.units as u
+from astropy.constants import G
 from astropy.io import fits
 from astropy.table import Table
 from astropy.wcs import WCS
 from numpy.polynomial import Polynomial
+from scipy.integrate import quad
 from scipy.stats import chi2 as chi2_dist
 
-from harmonic_fit import deproject_pixel_offsets, find_ringlog, load_maps, read_ringlog
+from galpy.orbit import Orbit
+from galpy.potential import NFWPotential
+from galpy.potential import evaluatePotentials
+from galpy.potential import vesc as galpy_vesc
+
+from harmonic_fit import deproject_pixel_offsets, find_ringlog, load_maps, make_geometry, pa_degeneracy_slope, read_ringlog
 
 # 1 km/s/kpc = 1 / CONVERSION_MYR Myr^-1 (unit conversion, not a free science
 # constant -- kept centralised so it never needs to be re-derived by hand).
@@ -57,71 +72,100 @@ CONVERSION_MYR = 977.8
 class Config:
     trm_dir: Path
     ringlog_path: Path
-    results_dir: Path  # <trm_dir>/results -- source of ring_results.ecsv
+    results_dir: Path  # <trm_dir>/results -- source of ring_results.ecsv/maps.npz/scans.npz
     output_dir: Optional[Path] = None  # where timescales.json is written; default results_dir
 
     side: str = "both"
 
     # Rotation-curve model: weighted least-squares polynomial (order=1,
-    # linear, by default), NOT an interpolating spline. With only a handful
-    # of rings, forcing the curve exactly through every point (as a natural
-    # cubic spline does) turns ring-to-ring scatter that is well within each
-    # ring's own E_VROT uncertainty into spurious curvature -- visibly a
-    # hump-and-dip in fig_rotation_curve, worst in the extrapolated region
-    # the void radius sits in. A weighted fit stays close to flat where the
-    # data support it instead. Weights are 1/sigma^2 with
-    # sigma = (E_VROT1 + E_VROT2)/2 per ring. Exposed here (not hardcoded)
-    # since a future TRM model with more rings, or a ring-to-ring trend that
-    # is large relative to its errors, may justify order=2.
+    # linear, by default), NOT an interpolating spline -- see
+    # generate_kinematic_curve's docstring.
     rotation_curve_poly_order: int = 1
 
-    # Epicyclic "kick" model (Section 3.2). alpha is fixed, not fitted --
-    # Wallin & Struck-Marcell (1994) Sec 3.1 derive the perturbation scaling
-    # (Delta v ~ q' omega' ~ (q/eps)^(-1/2)) rather than leaving it free; four
-    # data points cannot constrain a third free parameter (see module
-    # docstring / CLAUDE.md-style acceptance tests).
+    # Epicyclic "kick" model (Section 2.8's two-parameter alternative to the
+    # V_rad=0 null). alpha is fixed, not fitted -- Wallin & Struck-Marcell
+    # (1994) Sec 3.1 derive the perturbation scaling rather than leaving it
+    # free; four rings cannot constrain a third free parameter.
     alpha: float = 0.5
-    r_ref_kpc: float = 15.0  # reference radius for the kick amplitude V0
+    r_ref_kpc: float = 15.0
 
     v0_grid_max_kms: float = 200.0
     v0_grid_step_kms: float = 1.0
     t_grid_max_myr: float = 400.0
     t_grid_step_myr: float = 1.0
 
-    # Epoch range indicated by the other two clocks (T_phi, T_kappa/2), used
-    # only to quote a V0 upper limit -- not fitted.
-    t_estimate_lo_myr: float = 84.0
-    t_estimate_hi_myr: float = 100.0
-    upper_limit_cl: float = 0.68
+    # ------------------------------------------------------------------
+    # Section 0: NFW halo (galpy.potential.NFWPotential)
+    # ------------------------------------------------------------------
+    M200_Msun: float = 1.9e12
+    halo_concentration: float = 10.0
+    halo_H0_kms_Mpc: float = 70.0
+    halo_Om0: float = 0.3
+    galpy_ro_kpc: float = 8.0
+    galpy_vo_kms: float = 220.0
 
-    # Void geometry: RA/Dec corner coordinates are external inputs (read off
-    # the moment maps / continuum image), not derivable from the ringlog --
-    # same status as harmonic_plots.py's _EXTENT_BAND_ARCSEC.
+    # ------------------------------------------------------------------
+    # Void geometry (Section 2.3): RA/Dec corner coordinates are external
+    # inputs (read off the moment maps / continuum image), not derivable
+    # from the ringlog -- same status as harmonic_plots.py's
+    # _EXTENT_BAND_ARCSEC.
+    # ------------------------------------------------------------------
     void_center_hms: tuple = ((17, 29, 9.588425), (-62, 26, 44.518200))
     void_top_hms: tuple = ((17, 29, 12.171038), (-62, 26, 27.349434))
     void_bottom_hms: tuple = ((17, 29, 11.630122), (-62, 27, 20.094748))
-
-    # Legacy (superseded) void result, from the original notebook run with
-    # PA=48, incl=51.76, scale=0.329 and a non-project-standard deprojection
-    # -- kept only as a literal snapshot to print alongside the corrected
-    # value (Section 2.1), never recomputed with a second deprojection.
     legacy_void_r_avg_kpc: float = 13.88
     legacy_void_dtheta_deg: float = 105.75
 
-    # Bridge (Section 4). Not yet supplied: a real measurement of the
-    # bridge's sky-plane extent / LOS velocity difference and its position
-    # angle are required and are not present anywhere in this repo. Leave
-    # None to skip Section 4's reported result (the machinery is still
-    # exercised in the self-test against the worked example in the spec).
-    bridge_dR_over_dV_kpc_per_kms: Optional[float] = None
+    # ------------------------------------------------------------------
+    # Section 2.4: disk shear. None -> default to the ringlog's own
+    # innermost/outermost ring radius (never a free-floating literal).
+    # ------------------------------------------------------------------
+    shear_r_in_kpc: Optional[float] = None
+    shear_r_out_kpc: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Sections 2.5/2.6/2.7: the pair (companion). External measurements --
+    # none of these are derivable from this repo's own data products (the
+    # ringlog / moment maps cover only this galaxy, not its companion), so
+    # every section below skips cleanly (printed, not guessed) while they
+    # are None, rather than fabricating a placeholder.
+    # ------------------------------------------------------------------
+    vsys_table_kms: Optional[dict] = None    # {label: (value_kms, source_str)}
+    vsys_pair_label_a: Optional[str] = None  # dV_sys = table[label_b] - table[label_a]
+    vsys_pair_label_b: Optional[str] = None
+    R_sep_kpc: Optional[float] = None
     bridge_pa_deg: Optional[float] = None
     bridge_theta_sensitivity_step_deg: float = 5.0
+
+    r_peri_kpc: float = 12.0  # Wallin & Struck-Marcell (1994) Table 1: impact at half a disk radius
+    r_peri_scan_kpc: tuple = (0.0, 6.0, 12.0)
+    theta_scan_lo_deg: float = 40.0
+    theta_scan_hi_deg: float = 85.0
+    theta_scan_step_deg: float = 0.5
+
+    debris_dR_kpc: Optional[float] = None
+    debris_dV_kms: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Section 2.9: Wallin & Struck-Marcell epoch conversion
+    # ------------------------------------------------------------------
+    wsm_eps_grid_kpc: tuple = (10.0, 15.0, 20.0, 25.0)
+    wsm_epochs: tuple = (0.45, 0.56)
 
     def __post_init__(self):
         self.trm_dir = Path(self.trm_dir)
         self.ringlog_path = Path(self.ringlog_path)
         self.results_dir = Path(self.results_dir)
         self.output_dir = Path(self.output_dir) if self.output_dir is not None else self.results_dir
+
+
+def _q(value, unit: str, type_: str, assumption: str) -> dict:
+    """Section 3 (Output): the {value, unit, type, assumption} wrapper every
+    quantity in timescales.json (and every row of the Table 2 summary) must
+    use. type_ is one of "estimate" | "upper_limit" | "rejected" |
+    "exclusion"."""
+    assert type_ in ("estimate", "upper_limit", "rejected", "exclusion"), type_
+    return {"value": value, "unit": unit, "type": type_, "assumption": assumption}
 
 
 # --------------------------------------------------------------------------
@@ -147,14 +191,13 @@ class RotationCurveFit:
 
 def generate_kinematic_curve(radii_kpc, v_kms, v_err_lo=None, v_err_hi=None, order: int = 1) -> RotationCurveFit:
     """Weighted least-squares polynomial fit to the rotation curve --
-    order=1 (linear) by default, NOT an interpolating spline. See
-    Config.rotation_curve_poly_order for why: with only a handful of rings,
-    forcing the curve exactly through every point turns ring-to-ring scatter
-    that is well within each ring's own E_VROT uncertainty into spurious
-    curvature. Weights are 1/sigma^2 with sigma = (v_err_lo + v_err_hi)/2
-    per ring when errors are supplied, else unweighted (ordinary
-    least-squares). order is clipped to len(radii)-1 so this never raises
-    for a TRM model with fewer rings than the requested order.
+    order=1 (linear) by default, NOT an interpolating spline. With only a
+    handful of rings, forcing the curve exactly through every point turns
+    ring-to-ring scatter that is well within each ring's own E_VROT
+    uncertainty into spurious curvature. Weights are 1/sigma^2 with
+    sigma = (v_err_lo + v_err_hi)/2 per ring when errors are supplied, else
+    unweighted. order is clipped to len(radii)-1 so this never raises for a
+    TRM model with fewer rings than the requested order.
     """
     radii_kpc = np.asarray(radii_kpc, dtype=float)
     v_kms = np.asarray(v_kms, dtype=float)
@@ -172,10 +215,10 @@ def generate_kinematic_curve(radii_kpc, v_kms, v_err_lo=None, v_err_hi=None, ord
 
 
 def warn_if_extrapolating(name: str, R_kpc, r_min: float, r_max: float):
-    """CLAUDE.md-style guard (Section 2.2): the rotation-curve fit
-    extrapolates silently outside [r_min, r_max], and kappa depends on
-    dv/dR, which is least trustworthy in the extrapolated region. Warn
-    explicitly rather than letting it pass unnoticed."""
+    """The rotation-curve fit extrapolates silently outside [r_min, r_max],
+    and kappa depends on dv/dR, which is least trustworthy in the
+    extrapolated region. Warn explicitly rather than letting it pass
+    unnoticed."""
     R_arr = np.atleast_1d(np.asarray(R_kpc, dtype=float))
     below = R_arr[R_arr < r_min]
     above = R_arr[R_arr > r_max]
@@ -204,14 +247,15 @@ def calculate_frequencies(R_kpc, v_curve: RotationCurveFit):
 
 
 def calculate_timescales(Omega, kappa, conversion_myr: float = CONVERSION_MYR):
-    """Converts frequencies (km/s/kpc) to periods in Myr."""
+    """Converts frequencies (km/s/kpc) to periods in Myr. T_phi = 2*pi/Omega,
+    T_kappa = 2*pi/kappa (Section 2.1)."""
     T_phi = (2.0 * np.pi / Omega) * conversion_myr
     T_kappa = (2.0 * np.pi / kappa) * conversion_myr
     return T_phi, T_kappa
 
 
 # --------------------------------------------------------------------------
-# 1. Single source of truth for inputs
+# Single source of truth for inputs: rotation curve, radial velocities
 # --------------------------------------------------------------------------
 
 
@@ -230,16 +274,15 @@ class RotationCurve:
 
 
 def load_rotation_curve(ringlog_path: Path, order: int = 1) -> RotationCurve:
-    """Section 1.1: every ring parameter traces to the adopted ringlog --
-    no numeric literal for radius, velocity, PA, inclination, or scale
-    anywhere else in this module. order: rotation-curve polynomial order,
-    see Config.rotation_curve_poly_order."""
+    """Every ring parameter traces to the adopted ringlog -- no numeric
+    literal for radius, velocity, PA, inclination, or scale anywhere else in
+    this module."""
     t = read_ringlog(ringlog_path)
     radii_kpc = np.asarray(t["r_center_kpc"], dtype=float)
     v_kms = np.asarray(t["VROT(km/s)"], dtype=float)
     # E_VROT1/2 are signed offsets from Barolo (can be negative for the
-    # lower bound) -- Section 1.1 of this task calls them "absolute lower/
-    # upper errors" for errorbar plotting, so take abs() here, once.
+    # lower bound) -- treat as absolute lower/upper errors for weighting and
+    # errorbar plotting.
     v_err_lo = np.abs(np.asarray(t["E_VROT1"], dtype=float))
     v_err_hi = np.abs(np.asarray(t["E_VROT2"], dtype=float))
 
@@ -253,23 +296,17 @@ def load_rotation_curve(ringlog_path: Path, order: int = 1) -> RotationCurve:
             "load_rotation_curve: INC/P.A./XPOS/YPOS vary across rings in this ringlog -- "
             "this module assumes a single fiducial geometry (true for TRM_paper and "
             "fixed_PA42, both warp-free); a warped model needs per-ring geometry threaded "
-            "through the void deprojection instead of one fiducial row."
+            "through the void/R_ring deprojection instead of one fiducial row."
         )
 
     kpc_per_arcsec = float(t.meta["kpc_per_arcsec"])
     curve = generate_kinematic_curve(radii_kpc, v_kms, v_err_lo, v_err_hi, order=order)
 
     return RotationCurve(
-        radii_kpc=radii_kpc,
-        v_kms=v_kms,
-        v_err_lo=v_err_lo,
-        v_err_hi=v_err_hi,
-        inc_deg=float(inc_vals[0]),
-        pa_deg=float(pa_vals[0]),
-        xpos_pix=float(xpos_vals[0]),
-        ypos_pix=float(ypos_vals[0]),
-        kpc_per_arcsec=kpc_per_arcsec,
-        curve=curve,
+        radii_kpc=radii_kpc, v_kms=v_kms, v_err_lo=v_err_lo, v_err_hi=v_err_hi,
+        inc_deg=float(inc_vals[0]), pa_deg=float(pa_vals[0]),
+        xpos_pix=float(xpos_vals[0]), ypos_pix=float(ypos_vals[0]),
+        kpc_per_arcsec=kpc_per_arcsec, curve=curve,
     )
 
 
@@ -286,11 +323,11 @@ def load_radial_velocities(results_dir: Path, side: str = "both") -> RadialVeloc
     """Reads s1(R) and its bootstrap percentiles from ring_results.ecsv, for
     the given side and the primary weighting recorded in the table meta.
 
-    Sign convention (Section 1.2, CLAUDE.md 2.6.1): harmonic_fit.py's s1
-    keeps the raw fit sign; CLAUDE.md 2.6.1 resolves, for this galaxy (near
-    side at theta=+90 deg), true outward V_rad = -s1. The epicyclic "kick"
-    model here is written with V_R > 0 meaning outward (Wallin &
-    Struck-Marcell 1994), so the sign is flipped explicitly on read.
+    Sign convention (CLAUDE.md 2.6.1): harmonic_fit.py's s1 keeps the raw
+    fit sign; for this galaxy (near side at theta=+90 deg), true outward
+    V_rad = -s1. The epicyclic model here is written with V_R > 0 meaning
+    outward (Wallin & Struck-Marcell 1994), so the sign is flipped
+    explicitly on read.
     """
     t = Table.read(str(Path(results_dir) / "ring_results.ecsv"), format="ascii.ecsv")
     primary_weighting = t.meta["primary_weighting"]
@@ -308,14 +345,297 @@ def load_radial_velocities(results_dir: Path, side: str = "both") -> RadialVeloc
     return RadialVelocities(
         ring_index=np.asarray(sub["ring_index"], dtype=int),
         radii_kpc=np.asarray(sub["r_center_kpc"], dtype=float),
-        v_R_outward_kms=v_R_outward,
-        sigma_kms=sigma,
-        s1_raw_kms=s1,
+        v_R_outward_kms=v_R_outward, sigma_kms=sigma, s1_raw_kms=s1,
     )
 
 
 # --------------------------------------------------------------------------
-# 2. Void geometry
+# 0. NFW halo potential (galpy) -- the ONE Phi/M/v_esc implementation
+# --------------------------------------------------------------------------
+#
+# Never write a second phi(r)/M(r)/v_esc(r) NFW implementation anywhere in
+# this module -- every potential evaluation downstream (Sections 2.6, 2.9's
+# escape-velocity check) goes through build_nfw_potential()'s
+# galpy.potential.NFWPotential.
+
+
+def _halo_scale_quantities(cfg: Config):
+    """Exact-precision M_s (mass scale) and a (scale radius) from M_200 and
+    the concentration -- Section 0.1. Uses full float64 precision
+    throughout; the spec's rounded printed values (delta_c=1.4888,
+    M_s=1.276e12 Msun, a=25.55 kpc) are for the human reader only -- plugging
+    rounded intermediates into the actual verification is exactly what would
+    break the 1e-6 relative tolerance on Pot.mass(r_200) == M_200 (Section
+    4, acceptance test 2): with full precision that identity is exact by
+    construction (a = r_200/c, M_s = M_200/delta_c => M(r_200) = M_200
+    algebraically), so a 1e-6 failure there would mean a real bug, not a
+    rounding artifact.
+    """
+    c = cfg.halo_concentration
+    M200 = cfg.M200_Msun * u.Msun
+    delta_c = np.log(1.0 + c) - c / (1.0 + c)
+    Ms = M200 / delta_c
+    H0 = cfg.halo_H0_kms_Mpc * u.km / u.s / u.Mpc
+    rho_crit = (3.0 * H0**2 / (8.0 * np.pi * G)).to(u.Msun / u.kpc**3)
+    r200 = ((M200 / ((4.0 / 3.0) * np.pi * 200.0 * rho_crit)) ** (1.0 / 3.0)).to(u.kpc)
+    a = r200 / c
+    return Ms, a, r200, delta_c
+
+
+def build_nfw_potential(cfg: Config):
+    """Section 0: the ONE NFW potential used everywhere in this module.
+    Instantiated with astropy.units quantities and ro/vo set (Section 0.2),
+    so every evaluatePotentials/.mass/vesc call downstream returns physical
+    units directly -- no manual natural-unit conversion anywhere else."""
+    Ms, a, r200, _ = _halo_scale_quantities(cfg)
+    pot = NFWPotential(amp=Ms, a=a, ro=cfg.galpy_ro_kpc * u.kpc, vo=cfg.galpy_vo_kms * u.km / u.s)
+    return pot, Ms, a, r200
+
+
+def potential_kms2(pot, r_kpc) -> np.ndarray:
+    """Phi(r) in (km/s)^2, physical units in and out (Section 0.2)."""
+    r = np.atleast_1d(np.asarray(r_kpc, dtype=float)) * u.kpc
+    phi = np.asarray(evaluatePotentials(pot, r, 0.0 * u.kpc)) * (u.km**2 / u.s**2)
+    return phi.to(u.km**2 / u.s**2).value
+
+
+def escape_velocity_kms(pot, r_kpc) -> np.ndarray:
+    r = np.atleast_1d(np.asarray(r_kpc, dtype=float)) * u.kpc
+    ve = np.asarray(galpy_vesc(pot, r)) * (u.km / u.s)
+    return ve.to(u.km / u.s).value
+
+
+def verify_nfw_potential(cfg: Config, r_grid_kpc=None) -> dict:
+    """Section 0.1: the four assertions galpy's NFWPotential must satisfy
+    before anything downstream trusts it. Raises RuntimeError with both
+    values printed on any mismatch -- never proceeds silently."""
+    if r_grid_kpc is None:
+        r_grid_kpc = np.linspace(1.0, 200.0, 80)
+    pot, Ms, a, r200 = build_nfw_potential(cfg)
+    r = np.asarray(r_grid_kpc, dtype=float) * u.kpc
+
+    # 1. Potential: Phi(r) = -(G*Ms/r)*ln(1+r/a)
+    phi_g = potential_kms2(pot, r_grid_kpc) * (u.km**2 / u.s**2)
+    phi_a = (-(G * Ms / r) * np.log(1.0 + r / a)).to(u.km**2 / u.s**2)
+    rel1 = float(np.max(np.abs((phi_g - phi_a) / phi_a)).decompose())
+    if rel1 > 1e-10:
+        raise RuntimeError(f"NFW potential verification FAILED: galpy={phi_g}, analytic={phi_a}, max rel diff={rel1:.3e}")
+
+    # 2. Enclosed mass: M(r) = Ms*(ln(1+r/a) - (r/a)/(1+r/a)); M(r_200) == M_200
+    mass_g = np.asarray(pot.mass(r)) * u.Msun
+    mass_a = Ms * (np.log(1.0 + r / a) - (r / a) / (1.0 + r / a))
+    rel2 = float(np.max(np.abs((mass_g - mass_a) / mass_a)).decompose())
+    if rel2 > 1e-10:
+        raise RuntimeError(f"NFW enclosed-mass verification FAILED: galpy={mass_g}, analytic={mass_a}, max rel diff={rel2:.3e}")
+    m200_check = float(pot.mass(r200)) * u.Msun
+    M200_q = cfg.M200_Msun * u.Msun
+    rel_m200 = float(abs((m200_check - M200_q) / M200_q))
+    if rel_m200 > 1e-6:
+        raise RuntimeError(f"NFW mass(r_200) != M_200: got {m200_check}, expected {M200_q}, rel diff={rel_m200:.3e}")
+
+    # 3. Concentration constructor -- wrtcrit=True is essential (galpy
+    # defaults to wrtcrit=False: a matter-density-referenced r_200 that gives
+    # a substantially different answer; checked explicitly below).
+    pot_c = NFWPotential(
+        mvir=cfg.M200_Msun / 1e12, conc=cfg.halo_concentration, wrtcrit=True, overdens=200.0,
+        H=cfg.halo_H0_kms_Mpc, Om=cfg.halo_Om0, ro=cfg.galpy_ro_kpc * u.kpc, vo=cfg.galpy_vo_kms * u.km / u.s,
+    )
+    # .a is stored in ro-scaled natural units regardless of the use_physical
+    # setting (only evaluate*/mass/vesc function OUTPUTS respect it) --
+    # multiply by ro explicitly to get physical kpc.
+    a_c_kpc = float(pot_c.a) * cfg.galpy_ro_kpc
+    r200_c_kpc = a_c_kpc * cfg.halo_concentration
+    a_expected_kpc = a.to(u.kpc).value
+    r200_expected_kpc = r200.to(u.kpc).value
+    rel_a = abs(a_c_kpc - a_expected_kpc) / a_expected_kpc
+    rel_r200 = abs(r200_c_kpc - r200_expected_kpc) / r200_expected_kpc
+    if rel_a > 0.01 or rel_r200 > 0.01:
+        raise RuntimeError(
+            f"NFW concentration-constructor verification FAILED: a={a_c_kpc:.3f} kpc "
+            f"(expected {a_expected_kpc:.3f}), r_200={r200_c_kpc:.3f} kpc (expected {r200_expected_kpc:.3f})"
+        )
+    pot_wrong = NFWPotential(
+        mvir=cfg.M200_Msun / 1e12, conc=cfg.halo_concentration, wrtcrit=False, overdens=200.0,
+        H=cfg.halo_H0_kms_Mpc, Om=cfg.halo_Om0, ro=cfg.galpy_ro_kpc * u.kpc, vo=cfg.galpy_vo_kms * u.km / u.s,
+    )
+    a_wrong_kpc = float(pot_wrong.a) * cfg.galpy_ro_kpc
+    if abs(a_wrong_kpc - a_c_kpc) / a_c_kpc < 0.05:
+        raise RuntimeError(
+            f"NFW wrtcrit sanity check FAILED: wrtcrit=False gave a={a_wrong_kpc:.3f} kpc, barely "
+            f"different from wrtcrit=True's {a_c_kpc:.3f} kpc -- expected a substantial difference "
+            "(matter- vs critical-density-referenced r_200)."
+        )
+
+    # 4. Escape velocity: vesc(r) == sqrt(-2*Phi(r))
+    vesc_g = escape_velocity_kms(pot, r_grid_kpc) * (u.km / u.s)
+    vesc_a = np.sqrt(-2.0 * phi_a)
+    rel4 = float(np.max(np.abs((vesc_g - vesc_a) / vesc_a)).decompose())
+    if rel4 > 1e-6:
+        raise RuntimeError(f"NFW escape-velocity verification FAILED: galpy vesc={vesc_g}, sqrt(-2*Phi)={vesc_a}, max rel diff={rel4:.3e}")
+
+    result = {
+        "Ms_Msun": Ms.to(u.Msun).value, "a_kpc": a.to(u.kpc).value, "r200_kpc": r200.to(u.kpc).value,
+        "potential_max_rel_diff": rel1, "mass_max_rel_diff": rel2, "mass_r200_rel_diff": rel_m200,
+        "concentration_a_rel_diff": rel_a, "concentration_r200_rel_diff": rel_r200,
+        "wrtcrit_false_a_kpc": a_wrong_kpc, "vesc_max_rel_diff": rel4,
+    }
+    print(
+        f"[timescales] NFW verification PASSED (Section 0.1, all 4 assertions): "
+        f"M_s={result['Ms_Msun']:.6e} Msun, a={result['a_kpc']:.4f} kpc, r_200={result['r200_kpc']:.4f} kpc"
+    )
+    print(
+        f"    potential rel diff={rel1:.2e}  mass rel diff={rel2:.2e}  mass(r200) rel diff={rel_m200:.2e}\n"
+        f"    concentration-constructor: a rel diff={rel_a:.2e}, r200 rel diff={rel_r200:.2e} "
+        f"(wrtcrit=False gives a={a_wrong_kpc:.2f} kpc instead -- confirms wrtcrit=True matters)\n"
+        f"    vesc rel diff={rel4:.2e}"
+    )
+    return result
+
+
+# --------------------------------------------------------------------------
+# 1. R_ring: the surface-density peak, from the moment-0 map
+# --------------------------------------------------------------------------
+
+
+def load_data_mom0(maps_dir: Path):
+    """The data moment-0 map (integrated intensity) -- unused by
+    harmonic_fit.py (CLAUDE.md Section 1: "the 0mom pair ... is not used by
+    this pipeline"), so loaded here directly rather than extending
+    harmonic_fit.MapSet, which would touch that module's own frozen
+    deliverable rules for no benefit to it."""
+    maps_dir = Path(maps_dir)
+    files = sorted(maps_dir.glob("*_0mom.fits"))
+    files = [f for f in files if "_local_" not in f.name]
+    if len(files) != 1:
+        raise RuntimeError(f"Expected exactly one data _0mom.fits in {maps_dir}, found {len(files)}: {files}")
+    data = np.squeeze(fits.getdata(files[0])).astype(float)
+    header = fits.getheader(files[0])
+    return data, header
+
+
+@dataclass
+class SigmaHIProfile:
+    R_kpc: np.ndarray
+    R_edges_kpc: np.ndarray
+    sigma: np.ndarray        # inclination-corrected, azimuthally-averaged intensity per annulus
+    sigma_err: np.ndarray    # standard error of the mean within each annulus
+    n_pix: np.ndarray
+    R_ring_kpc: float
+    R_ring_arcsec: float
+    R_ring_err_kpc: float    # half the annulus width, in kpc
+    ring_index: int
+    annulus_width_arcsec: float
+
+
+def measure_R_ring(rc: RotationCurve, mom0_data: np.ndarray, header0, cdelt1_sign: int,
+                    annulus_width_arcsec: float) -> SigmaHIProfile:
+    """Section 1: the inclination-corrected, azimuthally-averaged Sigma_HI(R)
+    profile in concentric deprojected annuli, using harmonic_fit.make_geometry
+    -- the SAME deprojection harmonic_fit.py's ring fits use, not a second,
+    independently-defined one -- evaluated on the moment-0 pixel grid with
+    the disc's own fiducial geometry (rc.xpos_pix/ypos_pix/pa_deg/inc_deg).
+
+    Sigma is inclination-corrected as Sigma_face_on = Sigma_observed *
+    cos(i): a geometrically-thin, optically-thin disc's line-of-sight path
+    length through the disc scales as 1/cos(i), so its observed
+    (line-of-sight-integrated) column density is enhanced by that same
+    factor relative to the face-on value; dividing by that factor removes it.
+
+    Annulus width is the adopted TRM's own ring width (the same width
+    read_ringlog derives for the harmonic fit's rings), so the radial
+    binning resolution matches the rest of this project rather than
+    introducing a second, arbitrary free parameter. R_ring's uncertainty is
+    half that width."""
+    R_pix, _theta = make_geometry(mom0_data.shape, rc.xpos_pix, rc.ypos_pix, rc.pa_deg, rc.inc_deg, cdelt1_sign)
+    pixscale_arcsec = abs(header0["CDELT1"]) * 3600.0
+    R_arcsec = R_pix * pixscale_arcsec
+
+    finite = np.isfinite(mom0_data)
+    if not np.any(finite):
+        raise RuntimeError("measure_R_ring: moment-0 map has no finite pixels.")
+    R_max_arcsec = float(np.max(R_arcsec[finite]))
+
+    n_annuli = max(int(np.ceil(R_max_arcsec / annulus_width_arcsec)), 1)
+    edges_arcsec = np.arange(n_annuli + 1) * annulus_width_arcsec
+    centers_arcsec = 0.5 * (edges_arcsec[:-1] + edges_arcsec[1:])
+
+    cos_i = np.cos(np.radians(rc.inc_deg))
+    sigma = np.full(n_annuli, np.nan)
+    sigma_err = np.full(n_annuli, np.nan)
+    n_pix = np.zeros(n_annuli, dtype=int)
+    for i in range(n_annuli):
+        m = finite & (R_arcsec >= edges_arcsec[i]) & (R_arcsec < edges_arcsec[i + 1])
+        n_pix[i] = int(np.sum(m))
+        if n_pix[i] == 0:
+            continue
+        vals = mom0_data[m] * cos_i
+        sigma[i] = float(np.mean(vals))
+        if n_pix[i] > 1:
+            sigma_err[i] = float(np.std(vals, ddof=1) / np.sqrt(n_pix[i]))
+
+    valid = np.isfinite(sigma)
+    if not np.any(valid):
+        raise RuntimeError("measure_R_ring: no annulus has finite Sigma_HI -- check the moment-0 map/geometry.")
+    i_peak = int(np.argmax(np.where(valid, sigma, -np.inf)))
+
+    R_ring_arcsec = float(centers_arcsec[i_peak])
+    R_ring_kpc = R_ring_arcsec * rc.kpc_per_arcsec
+    R_ring_err_kpc = (annulus_width_arcsec / 2.0) * rc.kpc_per_arcsec
+
+    return SigmaHIProfile(
+        R_kpc=centers_arcsec * rc.kpc_per_arcsec, R_edges_kpc=edges_arcsec * rc.kpc_per_arcsec,
+        sigma=sigma, sigma_err=sigma_err, n_pix=n_pix,
+        R_ring_kpc=R_ring_kpc, R_ring_arcsec=R_ring_arcsec, R_ring_err_kpc=R_ring_err_kpc,
+        ring_index=i_peak, annulus_width_arcsec=annulus_width_arcsec,
+    )
+
+
+# --------------------------------------------------------------------------
+# 2.1 Epicyclic and orbital periods, per ring (already implemented)
+# --------------------------------------------------------------------------
+
+
+def t_kappa_half_per_ring(rc: RotationCurve):
+    """T_phi, T_kappa, T_kappa/2 per ring -- NOT a single global T_kappa/2:
+    it varies by up to 50% ring to ring, so a single number for the whole
+    ring is never reported."""
+    Omega, kappa = calculate_frequencies(rc.radii_kpc, rc.curve)
+    T_phi, T_kappa = calculate_timescales(Omega, kappa)
+    dv_dR = rc.curve.derivative()(rc.radii_kpc)
+    return T_phi, T_kappa, T_kappa / 2.0, dv_dR
+
+
+# --------------------------------------------------------------------------
+# 2.2 Ring turnaround (new): t = T_kappa(R_ring)/2
+# --------------------------------------------------------------------------
+
+
+def ring_turnaround_timescale(rc: RotationCurve, R_ring_kpc: float, R_ring_err_kpc: float):
+    """t = T_kappa(R_ring)/2. Uncertainty propagated from R_ring_err_kpc by
+    evaluating T_kappa at R_ring +/- its error and taking half the resulting
+    spread. A dissipative gas ring lags the collisionless (stellar) caustic
+    that T_kappa/2 formally predicts, so this is a LOWER LIMIT relative to
+    the stellar-population turnaround time, not an exact match to it."""
+    warn_if_extrapolating("ring turnaround (R_ring)", np.array([R_ring_kpc]), rc.radii_kpc.min(), rc.radii_kpc.max())
+    Omega0, kappa0 = calculate_frequencies(np.array([R_ring_kpc]), rc.curve)
+    _, T_kappa0 = calculate_timescales(Omega0, kappa0)
+    t0 = float(T_kappa0[0]) / 2.0
+
+    R_lo = max(R_ring_kpc - R_ring_err_kpc, 1e-6)
+    R_hi = R_ring_kpc + R_ring_err_kpc
+    _, kappa_lo = calculate_frequencies(np.array([R_lo]), rc.curve)
+    _, kappa_hi = calculate_frequencies(np.array([R_hi]), rc.curve)
+    Omega_lo, _ = calculate_frequencies(np.array([R_lo]), rc.curve)
+    Omega_hi, _ = calculate_frequencies(np.array([R_hi]), rc.curve)
+    _, T_kappa_lo = calculate_timescales(Omega_lo, kappa_lo)
+    _, T_kappa_hi = calculate_timescales(Omega_hi, kappa_hi)
+    t_err = abs(float(T_kappa_hi[0]) - float(T_kappa_lo[0])) / 4.0
+
+    return t0, t_err
+
+
+# --------------------------------------------------------------------------
+# 2.3 Crescent void (already implemented)
 # --------------------------------------------------------------------------
 
 
@@ -354,27 +674,15 @@ class VoidGeometry:
 
 
 def void_geometry(cfg: Config, rc: RotationCurve, header, cdelt1_sign: int) -> VoidGeometry:
-    """Section 2.1: deprojects the void's top/bottom sky corners about the
-    void's own reference point (its center, e.g. the AGN -- the same point
-    the original notebook used) using harmonic_fit.deproject_pixel_offsets,
-    the same rotation/handedness convention make_geometry uses internally,
-    rather than a second, independently-defined deprojection. Only the two
-    bugs CLAUDE.md-style Section 2.1 identifies are fixed here: the rotation
-    handedness, and dx's sky direction (the notebook's own dx = (ra-ra_c)*
-    cos(dec)*3600 increases east; the FITS grid's x increases west, since
-    CDELT1 < 0) -- both now handled correctly by going through the WCS
-    pixel position instead of a hand-rolled sky-plane formula. The void's
-    reference point (not the disc's XPOS/YPOS) is kept unchanged: R and
-    theta are being computed relative to the AGN as originally intended, and
-    deproject_pixel_offsets does not care what point dx, dy are measured
-    from (see acceptance test 3 in selftest()), only that the PA/inc
-    rotation is applied correctly.
+    """Deprojects the void's top/bottom sky corners about the void's own
+    reference point (its center) using harmonic_fit.deproject_pixel_offsets
+    -- the same rotation/handedness convention make_geometry uses
+    internally, not a second, independently-defined deprojection.
 
-    Section 2.2: guards the resulting radius against silent spline
-    extrapolation. Section 2.3: the reported interaction timescale is an
-    upper limit (Wallin & Struck-Marcell 1994, Sec 3.3.3 -- the void
-    continues to expand after formation, so a constant-Delta-theta
-    assumption underestimates the true elapsed time)."""
+    T_phi = 2*pi*R_void/V_c, t = T_phi*(dtheta/360). Wallin & Struck-Marcell
+    (1994) Sec 3.3.3: the void continues to expand after formation, so a
+    constant-dtheta assumption makes this an UPPER LIMIT, not a
+    measurement."""
     ra_c, dec_c = _radec_deg(cfg.void_center_hms)
     ra_t, dec_t = _radec_deg(cfg.void_top_hms)
     ra_b, dec_b = _radec_deg(cfg.void_bottom_hms)
@@ -406,33 +714,36 @@ def void_geometry(cfg: Config, rc: RotationCurve, header, cdelt1_sign: int) -> V
     t_interaction = T_phi_void * fraction
 
     return VoidGeometry(
-        r_avg_kpc=R_avg_kpc,
-        dtheta_deg=dtheta_deg,
-        fraction_of_orbit=fraction,
-        v_c_void_kms=v_c_void,
-        T_phi_void_myr=T_phi_void,
-        t_interaction_myr=t_interaction,
-        legacy_r_avg_kpc=cfg.legacy_void_r_avg_kpc,
-        legacy_dtheta_deg=cfg.legacy_void_dtheta_deg,
+        r_avg_kpc=R_avg_kpc, dtheta_deg=dtheta_deg, fraction_of_orbit=fraction,
+        v_c_void_kms=v_c_void, T_phi_void_myr=T_phi_void, t_interaction_myr=t_interaction,
+        legacy_r_avg_kpc=cfg.legacy_void_r_avg_kpc, legacy_dtheta_deg=cfg.legacy_void_dtheta_deg,
     )
 
 
-def void_azimuth_in_disk_frame(cfg: Config, rc: RotationCurve, header, cdelt1_sign: int) -> float:
-    """harmonic_fit.py-style azimuthal-modulation Test 1.4: the void's mean
-    azimuth in the SAME theta frame harmonic_fit.py's ring fits use --
-    relative to the disc's dynamical center (rc.xpos_pix, rc.ypos_pix), NOT
-    the void-centered frame void_geometry() uses for R_avg/dtheta. theta is
-    origin-dependent (deproject_pixel_offsets), and comparing against a
-    ring's recovered theta_1 (harmonic_fit.vr1_theta1_from_c2s2) requires
-    the disc's own center -- void_geometry() deliberately keeps the void's
-    own center for R_avg/dtheta (see its docstring), so this is a separate,
-    second evaluation of the same top/bottom corners, not a duplicate
-    deprojection implementation (still routed through
-    harmonic_fit.deproject_pixel_offsets).
+def void_interaction_nearest_vc(rc: RotationCurve, void: VoidGeometry) -> dict:
+    """Section 2.3 systematic: the interaction timescale obtained using the
+    nearest MEASURED ring's V_c (not the fitted/extrapolated rotation-curve
+    polynomial) at the void's radius -- reported alongside the fitted-curve
+    value (VoidGeometry.t_interaction_myr) as a systematic, not a second
+    central estimate."""
+    i_nearest = int(np.argmin(np.abs(rc.radii_kpc - void.r_avg_kpc)))
+    v_nearest = float(rc.v_kms[i_nearest])
+    R_nearest = float(rc.radii_kpc[i_nearest])
+    T_phi_nearest = (2.0 * np.pi * void.r_avg_kpc / v_nearest) * CONVERSION_MYR
+    t_nearest = T_phi_nearest * void.fraction_of_orbit
+    return {
+        "ring_index": i_nearest, "R_ring_kpc": R_nearest, "v_c_kms": v_nearest,
+        "T_phi_myr": T_phi_nearest, "t_interaction_myr": t_nearest,
+    }
 
-    Returns degrees in [0, 360): the circular mean of the void's top/bottom
-    corner azimuths (bisecting the shorter arc between them).
-    """
+
+def void_azimuth_in_disk_frame(cfg: Config, rc: RotationCurve, header, cdelt1_sign: int) -> float:
+    """harmonic_fit.py-style azimuthal-modulation cross-check: the void's
+    mean azimuth in the SAME theta frame harmonic_fit.py's ring fits use --
+    relative to the disc's dynamical center (rc.xpos_pix, rc.ypos_pix), NOT
+    the void-centered frame void_geometry() uses for R_avg/dtheta. Returns
+    degrees in [0, 360): the circular mean of the void's top/bottom corner
+    azimuths."""
     ra_t, dec_t = _radec_deg(cfg.void_top_hms)
     ra_b, dec_b = _radec_deg(cfg.void_bottom_hms)
     x_t, y_t = radec_to_pixel(header, ra_t, dec_t)
@@ -444,14 +755,334 @@ def void_azimuth_in_disk_frame(cfg: Config, rc: RotationCurve, header, cdelt1_si
 
 
 # --------------------------------------------------------------------------
-# 3. Epicyclic ("kick") grid search -- no optimiser
+# 2.4 Disk shear (new)
+# --------------------------------------------------------------------------
+
+
+def disk_shear_timescale(cfg: Config, rc: RotationCurve, adopted_age_myr: Optional[float] = None) -> dict:
+    """Delta_Omega = Omega(R_in) - Omega(R_out), t_shear = 1/Delta_Omega (one
+    radian of shear). An UPPER LIMIT on the age of any COHERENT MATERIAL
+    feature spanning [r_in, r_out] -- it does NOT apply to the ring itself,
+    which this project treats as a wave (epicyclic) pattern, not advected
+    material (see Section 2.2's T_kappa/2 for the ring's own clock).
+
+    r_in/r_out default to the ringlog's own innermost/outermost ring radius
+    (never a free-floating literal); Config.shear_r_in_kpc/shear_r_out_kpc
+    override for a specific feature."""
+    r_in = cfg.shear_r_in_kpc if cfg.shear_r_in_kpc is not None else float(rc.radii_kpc.min())
+    r_out = cfg.shear_r_out_kpc if cfg.shear_r_out_kpc is not None else float(rc.radii_kpc.max())
+    if r_out <= r_in:
+        raise ValueError(f"disk_shear_timescale: r_out ({r_out}) must exceed r_in ({r_in})")
+
+    Omega, _ = calculate_frequencies(np.array([r_in, r_out]), rc.curve)
+    delta_Omega = float(Omega[0] - Omega[1])
+    if delta_Omega <= 0:
+        raise RuntimeError(
+            f"disk_shear_timescale: Omega(r_in)={Omega[0]:.4f} <= Omega(r_out)={Omega[1]:.4f} km/s/kpc -- "
+            "the rotation curve is not differentially rotating (Omega decreasing outward) over this "
+            "radial range; t_shear is undefined."
+        )
+    t_shear_myr = (1.0 / delta_Omega) * CONVERSION_MYR
+
+    shear_angle_deg = None
+    if adopted_age_myr is not None:
+        shear_angle_deg = np.degrees(adopted_age_myr / t_shear_myr)
+
+    return {
+        "r_in_kpc": r_in, "r_out_kpc": r_out, "delta_Omega_km_s_kpc": delta_Omega,
+        "t_shear_myr": t_shear_myr, "adopted_age_myr": adopted_age_myr,
+        "shear_angle_at_adopted_age_deg": shear_angle_deg,
+    }
+
+
+# --------------------------------------------------------------------------
+# 2.5 Pair separation, linear (new)
+# --------------------------------------------------------------------------
+
+
+def compute_dV_sys(vsys_table_kms: dict, label_a: str, label_b: str) -> float:
+    """dV_sys = table[label_b] - table[label_a], read from a named table of
+    systemic-velocity measurements rather than hand-typed: the manuscript
+    previously carried inconsistent values (207 km/s in one place, 209 km/s
+    in another, with 240 km/s implied by the source table) precisely
+    because this difference was never computed from one single source.
+    Prints which pair was differenced so the provenance is always visible."""
+    if label_a not in vsys_table_kms or label_b not in vsys_table_kms:
+        raise KeyError(
+            f"compute_dV_sys: label {label_a!r} or {label_b!r} not in vsys_table_kms "
+            f"(available labels: {list(vsys_table_kms)})"
+        )
+    v_a, src_a = vsys_table_kms[label_a]
+    v_b, src_b = vsys_table_kms[label_b]
+    dV = float(v_b) - float(v_a)
+    print(
+        f"[timescales] dV_sys = VSYS[{label_b!r}] - VSYS[{label_a!r}] "
+        f"= ({v_b:.1f} km/s, {src_b}) - ({v_a:.1f} km/s, {src_a}) = {dV:.1f} km/s"
+    )
+    return dV
+
+
+def bridge_timescale_myr(R_over_dV_kpc_per_kms: float, theta_deg: float, conversion_myr: float = CONVERSION_MYR) -> float:
+    """t_lin = (R_sep/dV_sys)*cot(theta)*977.8 [Myr] (Section 2.5). A naive
+    t = R_sep/dV_sys*conversion_myr (no cot(theta) factor) implicitly
+    assumes theta=45 deg, since cot(45 deg)=1; this makes the assumed
+    line-of-sight angle explicit and correctable."""
+    theta_rad = np.radians(theta_deg)
+    return (R_over_dV_kpc_per_kms / np.tan(theta_rad)) * conversion_myr
+
+
+def bridge_timescale_sensitivity(theta_deg: float, dtheta_deg: float) -> float:
+    """dt/t = dtheta / (sin(theta)*cos(theta)) (dtheta in radians for the
+    ratio to be dimensionless)."""
+    theta_rad = np.radians(theta_deg)
+    return np.radians(dtheta_deg) / (np.sin(theta_rad) * np.cos(theta_rad))
+
+
+def validate_bridge_orientation(bridge_pa_deg: Optional[float], disc_pa_deg: float):
+    """The bridge lying along the disc's projected minor axis (PA=phi+90) is
+    what licenses theta=i (the disc-normal case) -- checked here, not
+    assumed. |bridge_pa - (phi+90)| < 5 deg is the pass condition; prints
+    both angles either way, and skips (rather than guesses) if no measured
+    bridge PA is supplied."""
+    expected_pa = (disc_pa_deg + 90.0) % 180.0
+    if bridge_pa_deg is None:
+        print(
+            "[timescales] Bridge orientation check SKIPPED: bridge_pa_deg not supplied "
+            f"(expected, if theta=i: {expected_pa:.2f} deg)."
+        )
+        return None
+    observed_pa = bridge_pa_deg % 180.0
+    diff = abs(observed_pa - expected_pa)
+    diff = min(diff, 180.0 - diff)
+    passed = diff < 5.0
+    print(
+        f"[timescales] Bridge orientation check: measured PA={observed_pa:.2f} deg vs. expected "
+        f"(disc minor axis, phi+90={expected_pa:.2f} deg) -- delta={diff:.2f} deg -- "
+        f"{'PASSED' if passed else 'FAILED'} (theta=i requires delta < 5 deg)"
+    )
+    return {"observed_pa_deg": observed_pa, "expected_pa_deg": expected_pa, "delta_deg": diff, "passed": passed}
+
+
+def pair_separation_linear(cfg: Config, rc: RotationCurve) -> Optional[dict]:
+    """Reports the naive theta=45 deg case explicitly (the value the
+    manuscript previously quoted) alongside the disk-normal theta=i case,
+    plus the sensitivity dt/t and the bridge-orientation check that licenses
+    theta=i. Skips cleanly (printed, not guessed) if the pair separation /
+    systemic-velocity table are not supplied."""
+    if cfg.R_sep_kpc is None or cfg.vsys_table_kms is None:
+        print("[timescales] Section 2.5 (pair separation, linear) SKIPPED: "
+              "R_sep_kpc and/or vsys_table_kms not supplied in Config.")
+        return None
+
+    dV_sys = compute_dV_sys(cfg.vsys_table_kms, cfg.vsys_pair_label_a, cfg.vsys_pair_label_b)
+    ratio = cfg.R_sep_kpc / dV_sys
+
+    t_naive = bridge_timescale_myr(ratio, 45.0)
+    t_disk_normal = bridge_timescale_myr(ratio, rc.inc_deg)
+    sens_naive = bridge_timescale_sensitivity(45.0, cfg.bridge_theta_sensitivity_step_deg)
+    sens_disk_normal = bridge_timescale_sensitivity(rc.inc_deg, cfg.bridge_theta_sensitivity_step_deg)
+    orientation = validate_bridge_orientation(cfg.bridge_pa_deg, rc.pa_deg)
+
+    return {
+        "R_sep_kpc": cfg.R_sep_kpc, "dV_sys_kms": dV_sys, "R_sep_over_dV_sys": ratio,
+        "t_naive_theta45_myr": t_naive, "sensitivity_naive_per_step": sens_naive,
+        "t_disk_normal_theta_i_myr": t_disk_normal, "sensitivity_disk_normal_per_step": sens_disk_normal,
+        "sensitivity_step_deg": cfg.bridge_theta_sensitivity_step_deg,
+        "theta_i_deg": rc.inc_deg, "orientation_check": orientation,
+    }
+
+
+# --------------------------------------------------------------------------
+# 2.6 Pair orbit integration (new, galpy)
+# --------------------------------------------------------------------------
+
+
+def orbit_time_quadrature_myr(pot, r_peri_kpc: float, r_now_kpc: float, v_now_kms: float) -> float:
+    """t = integral_{r_peri}^{r_now} dr/v(r), v(r) = sqrt(2*(E - Phi(r))),
+    E = v_now^2/2 + Phi(r_now). Phi from the ONE galpy NFWPotential built by
+    build_nfw_potential -- no second NFW implementation. r_peri >= r_now
+    returns 0 (already at/past the reference radius)."""
+    if r_peri_kpc >= r_now_kpc:
+        return 0.0
+    phi_now = potential_kms2(pot, r_now_kpc)[0]
+    E = 0.5 * v_now_kms**2 + phi_now
+
+    def integrand(r):
+        phi_r = potential_kms2(pot, r)[0]
+        v2 = 2.0 * (E - phi_r)
+        if v2 <= 0:
+            raise RuntimeError(
+                f"orbit_time_quadrature_myr: orbit not energetically allowed at r={r:.3f} kpc "
+                f"(E={E:.2f}, Phi(r)={phi_r:.2f} (km/s)^2)."
+            )
+        return 1.0 / np.sqrt(v2)
+
+    t_kpc_per_kms, _ = quad(integrand, r_peri_kpc, r_now_kpc, limit=200)
+    return t_kpc_per_kms * CONVERSION_MYR
+
+
+def orbit_time_via_galpy_orbit_myr(pot, r_peri_kpc: float, r_now_kpc: float, v_now_kms: float,
+                                    ro_kpc: float, vo_kms: float, n_steps: int = 20000) -> float:
+    """Cross-check for orbit_time_quadrature_myr (Section 4, acceptance test
+    3): integrates the SAME purely-radial orbit forward in time with
+    galpy.orbit.Orbit under the same potential, starting at r_now moving
+    inward at v_now, and finds when R(t) first reaches r_peri. Verification
+    only -- scipy's quadrature is far cheaper and is what the main results
+    path (pair_orbit_report) actually uses."""
+    if r_peri_kpc >= r_now_kpc:
+        return 0.0
+    ro, vo = ro_kpc * u.kpc, vo_kms * u.km / u.s
+    t_guess_myr = orbit_time_quadrature_myr(pot, r_peri_kpc, r_now_kpc, v_now_kms)
+    o = Orbit([r_now_kpc * u.kpc, -v_now_kms * u.km / u.s, 0.0 * u.km / u.s,
+               0.0 * u.kpc, 0.0 * u.km / u.s, 0.0 * u.rad], ro=ro, vo=vo)
+    ts = np.linspace(0.0, max(2.0 * t_guess_myr, 1.0), n_steps) * u.Myr
+    o.integrate(ts, pot)
+    Rs = np.asarray(o.R(ts))
+    below = np.nonzero(Rs <= r_peri_kpc)[0]
+    if below.size == 0:
+        raise RuntimeError(
+            f"orbit_time_via_galpy_orbit_myr: R(t) never reached r_peri={r_peri_kpc} kpc within the "
+            f"integrated time window (0 to {ts[-1]}); widen n_steps/time window."
+        )
+    i0 = int(below[0])
+    t_arr = ts.to(u.Myr).value
+    if i0 == 0:
+        return float(t_arr[0])
+    R0, R1 = Rs[i0 - 1], Rs[i0]
+    t0, t1 = t_arr[i0 - 1], t_arr[i0]
+    frac = (r_peri_kpc - R0) / (R1 - R0)
+    return float(t0 + frac * (t1 - t0))
+
+
+def pair_orbit_r_now_v_now(R_sep_kpc: float, dV_sys_kms: float, theta_deg: float):
+    """r_now = R_sep/sin(theta), v_now = dV_sys/cos(theta)."""
+    theta_rad = np.radians(theta_deg)
+    return R_sep_kpc / np.sin(theta_rad), dV_sys_kms / np.cos(theta_rad)
+
+
+def theta_for_target_t(theta_grid_deg, t_grid_myr, target_t_myr: float) -> Optional[float]:
+    """The theta at which t(theta) matches a target time (e.g. the
+    ring-turnaround estimate) -- linear interpolation at the first sign
+    change of (t - target) on the grid; None if the target is outside the
+    grid's range."""
+    t = np.asarray(t_grid_myr, dtype=float)
+    theta = np.asarray(theta_grid_deg, dtype=float)
+    diff = t - target_t_myr
+    cross = np.nonzero(np.diff(np.sign(diff)) != 0)[0]
+    if cross.size == 0:
+        return None
+    j = cross[0]
+    frac = -diff[j] / (diff[j + 1] - diff[j])
+    return float(theta[j] + frac * (theta[j + 1] - theta[j]))
+
+
+def pair_orbit_report(cfg: Config, rc: RotationCurve, target_t_myr: Optional[float] = None) -> Optional[dict]:
+    """t for r_peri in cfg.r_peri_scan_kpc (sensitivity), a theta scan from
+    cfg.theta_scan_lo_deg to cfg.theta_scan_hi_deg tabulating
+    r_now/v_now/t/v_over_vesc, and the headline numbers: t at theta=i
+    (disk-normal), the theta at which v/v_esc=1 (a hard lower bound on t if
+    the pair is bound), and the theta needed to match target_t_myr (e.g. the
+    ring-turnaround estimate). Skips cleanly if the pair separation /
+    systemic-velocity table are not supplied."""
+    if cfg.R_sep_kpc is None or cfg.vsys_table_kms is None:
+        print("[timescales] Section 2.6 (pair orbit integration) SKIPPED: "
+              "R_sep_kpc and/or vsys_table_kms not supplied in Config.")
+        return None
+
+    pot, Ms, a, r200 = build_nfw_potential(cfg)
+    dV_sys = compute_dV_sys(cfg.vsys_table_kms, cfg.vsys_pair_label_a, cfg.vsys_pair_label_b)
+
+    r_now_i, v_now_i = pair_orbit_r_now_v_now(cfg.R_sep_kpc, dV_sys, rc.inc_deg)
+    r_peri_report = []
+    for r_peri in cfg.r_peri_scan_kpc:
+        t = orbit_time_quadrature_myr(pot, r_peri, r_now_i, v_now_i)
+        r_peri_report.append({"r_peri_kpc": r_peri, "t_myr": t})
+
+    theta_grid = np.arange(cfg.theta_scan_lo_deg, cfg.theta_scan_hi_deg + 1e-9, cfg.theta_scan_step_deg)
+    r_now_grid = np.empty_like(theta_grid)
+    v_now_grid = np.empty_like(theta_grid)
+    t_grid = np.empty_like(theta_grid)
+    vesc_grid = np.empty_like(theta_grid)
+    for i, theta in enumerate(theta_grid):
+        r_now, v_now = pair_orbit_r_now_v_now(cfg.R_sep_kpc, dV_sys, theta)
+        r_now_grid[i] = r_now
+        v_now_grid[i] = v_now
+        vesc_grid[i] = escape_velocity_kms(pot, r_now)[0]
+        t_grid[i] = orbit_time_quadrature_myr(pot, cfg.r_peri_kpc, r_now, v_now)
+    v_over_vesc_grid = v_now_grid / vesc_grid
+
+    i_theta_i = int(np.argmin(np.abs(theta_grid - rc.inc_deg)))
+    t_at_theta_i = float(t_grid[i_theta_i])
+
+    unbound = v_over_vesc_grid >= 1.0
+    theta_v_eq_vesc = None
+    if np.any(unbound) and np.any(~unbound):
+        cross = np.nonzero(np.diff(unbound.astype(int)) != 0)[0]
+        if cross.size:
+            j = cross[0]
+            frac = (1.0 - v_over_vesc_grid[j]) / (v_over_vesc_grid[j + 1] - v_over_vesc_grid[j])
+            theta_v_eq_vesc = float(theta_grid[j] + frac * (theta_grid[j + 1] - theta_grid[j]))
+
+    theta_match_target = theta_for_target_t(theta_grid, t_grid, target_t_myr) if target_t_myr is not None else None
+
+    return {
+        "R_sep_kpc": cfg.R_sep_kpc, "dV_sys_kms": dV_sys, "r_peri_fiducial_kpc": cfg.r_peri_kpc,
+        "r_peri_scan": r_peri_report,
+        "theta_grid_deg": theta_grid, "r_now_grid_kpc": r_now_grid, "v_now_grid_kms": v_now_grid,
+        "t_grid_myr": t_grid, "v_over_vesc_grid": v_over_vesc_grid,
+        "theta_i_deg": rc.inc_deg, "t_at_theta_i_myr": t_at_theta_i,
+        "theta_v_eq_vesc_deg": theta_v_eq_vesc,
+        "target_t_myr": target_t_myr, "theta_matching_target_deg": theta_match_target,
+        "Ms_Msun": Ms.to(u.Msun).value, "a_kpc": a.to(u.kpc).value, "r200_kpc": r200.to(u.kpc).value,
+    }
+
+
+# --------------------------------------------------------------------------
+# 2.7 Debris expansion and the free-expansion test (new)
+# --------------------------------------------------------------------------
+
+
+def debris_free_expansion_test(cfg: Config, rc: RotationCurve) -> Optional[dict]:
+    """Free expansion from a common origin implies v=r/t, so the velocity
+    gradient must be equal throughout the system: grad_debris =
+    dV_debris/dR_debris vs. grad_pair = dV_sys/R_sep. If they differ, free
+    expansion is REJECTED, and t_debris is reported for completeness ONLY --
+    flagged as rejected, never returned/used as a timescale estimate. Skips
+    cleanly if the debris measurements or the pair separation/velocity table
+    are not supplied."""
+    if cfg.debris_dR_kpc is None or cfg.debris_dV_kms is None:
+        print("[timescales] Section 2.7 (debris expansion) SKIPPED: "
+              "debris_dR_kpc and/or debris_dV_kms not supplied in Config.")
+        return None
+    if cfg.R_sep_kpc is None or cfg.vsys_table_kms is None:
+        print("[timescales] Section 2.7 (debris expansion) SKIPPED: "
+              "R_sep_kpc and/or vsys_table_kms not supplied in Config (needed for grad_pair).")
+        return None
+
+    dV_sys = compute_dV_sys(cfg.vsys_table_kms, cfg.vsys_pair_label_a, cfg.vsys_pair_label_b)
+    grad_debris = cfg.debris_dV_kms / cfg.debris_dR_kpc
+    grad_pair = dV_sys / cfg.R_sep_kpc
+    ratio = grad_debris / grad_pair
+    t_debris_myr = bridge_timescale_myr(cfg.debris_dR_kpc / cfg.debris_dV_kms, rc.inc_deg)
+
+    print(
+        f"[timescales] Section 2.7: grad_debris={grad_debris:.4f} km/s/kpc, grad_pair={grad_pair:.4f} km/s/kpc, "
+        f"ratio={ratio:.3f} -- free expansion is REJECTED if this ratio is far from 1. "
+        f"t_debris={t_debris_myr:.1f} Myr is reported for completeness ONLY -- NOT a clock."
+    )
+    return {"grad_debris_km_s_kpc": grad_debris, "grad_pair_km_s_kpc": grad_pair, "ratio": ratio,
+            "t_debris_myr_REJECTED": t_debris_myr}
+
+
+# --------------------------------------------------------------------------
+# 3. Epicyclic ("kick") chi2 grid -- the two-parameter model in Section 2.8
 # --------------------------------------------------------------------------
 
 
 def kick_model_v_R(R_kpc, t_myr, V0_kms, alpha, v_curve, r_ref_kpc, conversion_myr=CONVERSION_MYR):
     """Wallin & Struck-Marcell (1994)-style radial kick, damped/oscillating
     through the epicyclic frequency: V_R(R, t) = V0*(R/r_ref)^-alpha *
-    sin(kappa(R)*t). V0 > 0, R_kpc scalar or array; t_myr scalar."""
+    sin(kappa(R)*t)."""
     R_kpc = np.asarray(R_kpc, dtype=float)
     _, kappa = calculate_frequencies(R_kpc, v_curve)
     kappa_myr = kappa / conversion_myr
@@ -470,121 +1101,183 @@ class EpicyclicGrid:
 
 
 def epicyclic_chi2_grid(cfg: Config, rv: RadialVelocities, rc: RotationCurve) -> EpicyclicGrid:
-    """Section 3.2: grid, don't optimise. chi2(V0, t) = sum_i [(V_R_obs_i -
-    model_i)^2 / sigma_i^2], evaluated on a 2D grid. Fully vectorised --
-    no scipy.optimize call anywhere in this path."""
+    """chi2(V0, t) = sum_i [(V_R_obs_i - model_i)^2 / sigma_i^2], evaluated
+    on a 2D grid -- no scipy.optimize call anywhere in this path. This grid's
+    minimum is the "two-parameter epicyclic model" chi2 used in Section
+    2.8's exclusion test against the V_rad=0 null."""
     warn_if_extrapolating("epicyclic grid (ring radii)", rv.radii_kpc, rc.radii_kpc.min(), rc.radii_kpc.max())
 
     V0_grid = np.arange(0.0, cfg.v0_grid_max_kms + 1e-9, cfg.v0_grid_step_kms)
     t_grid = np.arange(0.0, cfg.t_grid_max_myr + 1e-9, cfg.t_grid_step_myr)
 
     _, kappa = calculate_frequencies(rv.radii_kpc, rc.curve)
-    kappa_myr = kappa / CONVERSION_MYR  # (n_rings,)
-    R_ratio = (rv.radii_kpc / cfg.r_ref_kpc) ** (-cfg.alpha)  # (n_rings,)
+    kappa_myr = kappa / CONVERSION_MYR
+    R_ratio = (rv.radii_kpc / cfg.r_ref_kpc) ** (-cfg.alpha)
 
     V0 = V0_grid[:, None, None]
     t = t_grid[None, :, None]
-    model = V0 * R_ratio[None, None, :] * np.sin(kappa_myr[None, None, :] * t)  # (nV0, nt, n_rings)
+    model = V0 * R_ratio[None, None, :] * np.sin(kappa_myr[None, None, :] * t)
     resid = (rv.v_R_outward_kms[None, None, :] - model) / rv.sigma_kms[None, None, :]
-    chi2 = np.sum(resid**2, axis=2)  # (nV0, nt)
+    chi2 = np.sum(resid**2, axis=2)
 
     i_min = np.unravel_index(np.argmin(chi2), chi2.shape)
     return EpicyclicGrid(
-        V0_grid_kms=V0_grid,
-        t_grid_myr=t_grid,
-        chi2=chi2,
-        chi2_min=float(chi2[i_min]),
-        V0_at_min=float(V0_grid[i_min[0]]),
-        t_at_min=float(t_grid[i_min[1]]),
+        V0_grid_kms=V0_grid, t_grid_myr=t_grid, chi2=chi2, chi2_min=float(chi2[i_min]),
+        V0_at_min=float(V0_grid[i_min[0]]), t_at_min=float(t_grid[i_min[1]]),
     )
 
 
-def v0_upper_limit(grid: EpicyclicGrid, t_lo_myr: float, t_hi_myr: float, cl: float = 0.68):
-    """Section 3.2: 'quote an upper limit on V0'. At each t in
-    [t_lo_myr, t_hi_myr], profile chi2 over V0 relative to chi2(V0=0, t) --
-    the best fit sits at the V0=0 boundary (Section 3.1), so a one-parameter
-    (1 dof) likelihood-ratio upper limit is well posed there even though a
-    two-sided error bar is not. Returns the tightest (most conservative)
-    upper limit over the t range, plus the full per-t array."""
-    delta_chi2_crit = chi2_dist.ppf(cl, df=1)
-    it_lo = np.searchsorted(grid.t_grid_myr, t_lo_myr)
-    it_hi = np.searchsorted(grid.t_grid_myr, t_hi_myr, side="right")
-    if it_hi <= it_lo:
-        raise ValueError(f"v0_upper_limit: [{t_lo_myr}, {t_hi_myr}] Myr does not overlap the t grid")
+# --------------------------------------------------------------------------
+# 2.8 Radial oscillation exclusion (already partly implemented)
+# --------------------------------------------------------------------------
 
-    V0_ul = np.empty(it_hi - it_lo)
-    t_used = grid.t_grid_myr[it_lo:it_hi]
-    for j, it in enumerate(range(it_lo, it_hi)):
-        profile = grid.chi2[:, it]
-        delta = profile - profile[0]  # profile[0] is V0=0
-        below = np.nonzero(delta <= delta_chi2_crit)[0]
-        V0_ul[j] = grid.V0_grid_kms[below.max()] if below.size else 0.0
 
-    j_tightest = np.argmin(V0_ul)
+def pa_uncertainty_from_scan(results_dir: Path, ring_index: int) -> Optional[float]:
+    """Formal PA uncertainty for one ring: half the delta_chi2=1 width of the
+    PA scan's chi2_best(PA) curve, already computed and written by
+    harmonic_fit.py's pa_scan -- not a second, independently fitted PA
+    uncertainty. Returns None if scans.npz lacks that ring's PA scan."""
+    path = Path(results_dir) / "scans.npz"
+    if not path.exists():
+        return None
+    d = np.load(path)
+    grid_key, chi2_key = f"ring{ring_index}_pa_pa_grid_deg", f"ring{ring_index}_pa_chi2_best"
+    if grid_key not in d.files or chi2_key not in d.files:
+        return None
+    pa_grid, chi2_best = d[grid_key], d[chi2_key]
+    i_min = int(np.argmin(chi2_best))
+    delta = chi2_best - chi2_best[i_min]
+    within = np.nonzero(delta <= 1.0)[0]
+    if within.size < 2:
+        return None
+    return float((pa_grid[within.max()] - pa_grid[within.min()]) / 2.0)
+
+
+def radial_oscillation_exclusion(cfg: Config, rv: RadialVelocities, rc: RotationCurve, grid: EpicyclicGrid) -> dict:
+    """chi2/dof for the null V_rad=0, delta_chi2 against the two-parameter
+    (V0, t) epicyclic grid (Section 3), and the per-annulus significance
+    V_rad_i/sigma_i. Deliberately does NOT quote an amplitude limit in pc --
+    the statistical limit on V0 is swamped by the PA systematic
+    (harmonic_fit.pa_degeneracy_slope, with phi's own formal uncertainty
+    read from the PA scan already computed by harmonic_fit.py, never
+    re-derived or hardcoded here) and by beam dilution (the beam is wider
+    than the ring); both are printed alongside the statistical error so the
+    comparison is explicit."""
+    chi2_null = float(np.sum((rv.v_R_outward_kms / rv.sigma_kms) ** 2))
+    dof_null = len(rv.v_R_outward_kms)
+    chi2_null_reduced = chi2_null / dof_null
+    chi2_2param = grid.chi2_min
+    delta_chi2 = chi2_null - chi2_2param
+    significance = rv.v_R_outward_kms / rv.sigma_kms
+
+    n = len(rv.ring_index)
+    pa_systematic_kms_per_deg = np.full(n, np.nan)
+    pa_uncertainty_deg = np.full(n, np.nan)
+    maps_path = Path(cfg.results_dir) / "maps.npz"
+    if maps_path.exists():
+        maps = np.load(maps_path)
+        for k, ring_idx in enumerate(rv.ring_index):
+            theta_key = f"ring{ring_idx}_theta"
+            mask_key = f"ring{ring_idx}_ring_mask_both"
+            w_key = f"ring{ring_idx}_weights_primary"
+            if theta_key not in maps.files:
+                continue
+            mask = maps[mask_key]
+            theta_m = maps[theta_key][mask]
+            w_m = maps[w_key][mask]
+            slope_per_rad = pa_degeneracy_slope(theta_m, w_m, float(rc.v_kms[ring_idx]), rc.inc_deg)
+            pa_systematic_kms_per_deg[k] = slope_per_rad * np.pi / 180.0
+            pa_unc = pa_uncertainty_from_scan(cfg.results_dir, int(ring_idx))
+            if pa_unc is not None:
+                pa_uncertainty_deg[k] = pa_unc
+
+    pa_systematic_kms = np.abs(pa_systematic_kms_per_deg) * pa_uncertainty_deg
+
+    print(
+        f"[timescales] Section 2.8: chi2/dof (null V_rad=0) = {chi2_null:.2f}/{dof_null} = "
+        f"{chi2_null_reduced:.3f}; delta_chi2 (vs. 2-param epicyclic grid min) = {delta_chi2:.2f}"
+    )
+    for k, ring_idx in enumerate(rv.ring_index):
+        print(
+            f"    ring {ring_idx}: V_rad/sigma = {significance[k]:+.2f}   "
+            f"PA systematic = {pa_systematic_kms_per_deg[k]:+.3f} km/s/deg * "
+            f"{pa_uncertainty_deg[k]:.2f} deg (TRM PA scan) = {pa_systematic_kms[k]:.2f} km/s   "
+            f"vs. statistical sigma = {rv.sigma_kms[k]:.2f} km/s"
+        )
+    print(
+        "[timescales] No amplitude limit in pc is quoted: the statistical limit on V0 is swamped by the "
+        "PA systematic and by beam dilution (beam wider than the ring), shown above."
+    )
+
     return {
-        "t_grid_myr": t_used,
-        "V0_upper_limit_kms": V0_ul,
-        "V0_upper_limit_tightest_kms": float(V0_ul[j_tightest]),
-        "t_at_tightest_myr": float(t_used[j_tightest]),
-        "cl": cl,
-        "delta_chi2_crit": float(delta_chi2_crit),
+        "chi2_null": chi2_null, "dof_null": dof_null, "chi2_null_reduced": chi2_null_reduced,
+        "chi2_2param_epicyclic_min": chi2_2param, "delta_chi2": delta_chi2,
+        "ring_index": rv.ring_index.tolist(), "significance_V_rad_over_sigma": significance.tolist(),
+        "pa_systematic_kms_per_deg": pa_systematic_kms_per_deg.tolist(),
+        "pa_uncertainty_deg": pa_uncertainty_deg.tolist(),
+        "pa_systematic_kms": pa_systematic_kms.tolist(),
+        "statistical_sigma_kms": rv.sigma_kms.tolist(),
     }
 
 
-def t_kappa_half_per_ring(rc: RotationCurve):
-    """Section 3.2: 'report T_kappa/2 per ring, not globally' -- a single t
-    cannot place every ring at turnaround simultaneously."""
-    Omega, kappa = calculate_frequencies(rc.radii_kpc, rc.curve)
-    T_phi, T_kappa = calculate_timescales(Omega, kappa)
-    return T_phi, T_kappa, T_kappa / 2.0
-
-
 # --------------------------------------------------------------------------
-# 4. Bridge timescale deprojection
+# 2.9 Wallin & Struck-Marcell (1994) epoch conversion (new)
 # --------------------------------------------------------------------------
 
 
-def bridge_timescale_myr(dR_over_dV_kpc_per_kms: float, theta_deg: float, conversion_myr: float = CONVERSION_MYR) -> float:
-    """t_bridge = (dR_sky/dV_los) * cot(theta) * conversion_myr. A naive
-    t = dR/dV*conversion_myr (no cot(theta) factor) implicitly assumes
-    theta=45 deg, since cot(45 deg)=1; this makes the assumed line-of-sight
-    angle explicit and correctable."""
-    theta_rad = np.radians(theta_deg)
-    return (dR_over_dV_kpc_per_kms / np.tan(theta_rad)) * conversion_myr
+def wsm_epoch_conversion(cfg: Config, rc: RotationCurve, R_ring_kpc: float) -> dict:
+    """Their model times are in units of 2*pi/omega(eps), the epicyclic
+    period AT THE SOFTENING LENGTH eps -- t_WSM = f*T_kappa(eps). Their
+    AM 1724-like epochs are f=0.45 and 0.56 (Figs. 5a, 6). Tabulated over
+    cfg.wsm_eps_grid_kpc so the sensitivity to that identification is
+    visible; eps=R_ring is marked separately since their Section 4.2
+    supports it (best morphological match when the ring has propagated to
+    about one softening length, near the rotation-curve turnover)."""
+    eps_grid = np.array(cfg.wsm_eps_grid_kpc, dtype=float)
+    warn_if_extrapolating("WSM epoch conversion (eps grid)", eps_grid, rc.radii_kpc.min(), rc.radii_kpc.max())
+    Omega_eps, kappa_eps = calculate_frequencies(eps_grid, rc.curve)
+    _, T_kappa_eps = calculate_timescales(Omega_eps, kappa_eps)
 
+    table = []
+    for eps, T_kappa in zip(eps_grid, T_kappa_eps):
+        row = {"eps_kpc": float(eps), "T_kappa_eps_myr": float(T_kappa)}
+        for f in cfg.wsm_epochs:
+            row[f"t_WSM_f{f}_myr"] = float(f) * float(T_kappa)
+        table.append(row)
 
-def bridge_timescale_sensitivity(theta_deg: float, dtheta_deg: float) -> float:
-    """delta_t/t = delta_theta / (sin(theta)*cos(theta)) (delta_theta in
-    radians for the ratio to be dimensionless)."""
-    theta_rad = np.radians(theta_deg)
-    return np.radians(dtheta_deg) / (np.sin(theta_rad) * np.cos(theta_rad))
+    warn_if_extrapolating("WSM epoch conversion (eps=R_ring)", np.array([R_ring_kpc]), rc.radii_kpc.min(), rc.radii_kpc.max())
+    Omega_ring, kappa_ring = calculate_frequencies(np.array([R_ring_kpc]), rc.curve)
+    _, T_kappa_ring = calculate_timescales(Omega_ring, kappa_ring)
+    ring_row = {"eps_kpc": R_ring_kpc, "T_kappa_eps_myr": float(T_kappa_ring[0])}
+    for f in cfg.wsm_epochs:
+        ring_row[f"t_WSM_f{f}_myr"] = float(f) * float(T_kappa_ring[0])
 
-
-def validate_bridge_orientation(bridge_pa_deg: Optional[float], disc_pa_deg: float):
-    """A bridge along the disk normal (theta=i, Wallin & Struck-Marcell
-    Table 1: orbital inclination 90 deg) must project onto the sky as the
-    disc's projected minor axis, i.e. at disc_pa_deg + 90. Prints both
-    angles so the theta=i assumption is testable, not just assumed; skips
-    (rather than guesses) if no measured bridge PA is available."""
-    expected_pa = (disc_pa_deg + 90.0) % 180.0
-    if bridge_pa_deg is None:
-        print(
-            "[timescales] Bridge orientation validation SKIPPED: no measured bridge "
-            f"position angle supplied (expected, if theta=i: {expected_pa:.2f} deg)."
-        )
-        return None
-    observed_pa = bridge_pa_deg % 180.0
-    print(
-        f"[timescales] Bridge orientation validation: measured PA={observed_pa:.2f} deg "
-        f"vs. expected (disc minor axis, theta=i) PA={expected_pa:.2f} deg "
-        f"(delta={abs(observed_pa - expected_pa):.2f} deg)"
-    )
-    return observed_pa, expected_pa
+    return {"eps_grid_table": table, "eps_equals_R_ring": ring_row, "epochs": list(cfg.wsm_epochs)}
 
 
 # --------------------------------------------------------------------------
 # Results assembly / I/O
 # --------------------------------------------------------------------------
+
+
+def _adopted_age_range(quantities: dict):
+    """The "adopted age and range" used for fig_clocks's horizontal band and
+    the shear-angle report: whichever of {ring turnaround (2.2), WSM at
+    eps=R_ring (2.9, both epochs), pair orbit at theta=i (2.6)} are
+    available (the pair-orbit contribution only when the pair data is
+    supplied), taking the overall min/max -- never a hand-typed number."""
+    candidates = {}
+    for name, q in quantities.items():
+        if q is not None and q.get("unit") == "Myr" and np.isfinite(q["value"]):
+            candidates[name] = q["value"]
+    if not candidates:
+        return None
+    lo_name = min(candidates, key=candidates.get)
+    hi_name = max(candidates, key=candidates.get)
+    return {
+        "lo_myr": candidates[lo_name], "hi_myr": candidates[hi_name],
+        "lo_source": lo_name, "hi_source": hi_name, "contributors": candidates,
+    }
 
 
 def run(cfg: Config) -> dict:
@@ -596,91 +1289,219 @@ def run(cfg: Config) -> dict:
     cdelt1_sign = -1 if mapset.cdelt1_deg < 0 else (1 if mapset.cdelt1_deg > 0 else 0)
     data_1mom = sorted((cfg.trm_dir / "maps").glob("*_1mom.fits"))
     data_1mom = [f for f in data_1mom if "_local_" not in f.name][0]
-    header = fits.getheader(data_1mom)
+    header1 = fits.getheader(data_1mom)
 
-    T_phi_ring, T_kappa_ring, T_kappa_half_ring = t_kappa_half_per_ring(rc)
+    # -------- Section 0: NFW verification --------
+    nfw_check = verify_nfw_potential(cfg)
 
-    void = void_geometry(cfg, rc, header, cdelt1_sign)
+    # -------- Section 1: R_ring --------
+    mom0_data, header0 = load_data_mom0(cfg.trm_dir / "maps")
+    sigma_profile = measure_R_ring(rc, mom0_data, header0, cdelt1_sign, ringlog.meta["ring_width_arcsec"])
+
+    # -------- 2.1 per-ring clocks --------
+    T_phi_ring, T_kappa_ring, T_kappa_half_ring, dv_dR_ring = t_kappa_half_per_ring(rc)
+
+    # -------- 2.2 ring turnaround --------
+    t_ring_turnaround, t_ring_turnaround_err = ring_turnaround_timescale(rc, sigma_profile.R_ring_kpc, sigma_profile.R_ring_err_kpc)
+
+    # -------- 2.3 crescent void --------
+    void = void_geometry(cfg, rc, header1, cdelt1_sign)
+    void_nearest_vc = void_interaction_nearest_vc(rc, void)
+
+    # -------- 3 + 2.8: epicyclic grid + radial-oscillation exclusion --------
     grid = epicyclic_chi2_grid(cfg, rv, rc)
-    ul = v0_upper_limit(grid, cfg.t_estimate_lo_myr, cfg.t_estimate_hi_myr, cfg.upper_limit_cl)
+    exclusion = radial_oscillation_exclusion(cfg, rv, rc, grid)
 
-    bridge = None
-    if cfg.bridge_dR_over_dV_kpc_per_kms is not None:
-        theta_deg = rc.inc_deg  # Section 4: theta = i (bridge along the disc normal)
-        t_bridge = bridge_timescale_myr(cfg.bridge_dR_over_dV_kpc_per_kms, theta_deg)
-        sensitivity = bridge_timescale_sensitivity(theta_deg, cfg.bridge_theta_sensitivity_step_deg)
-        validation = validate_bridge_orientation(cfg.bridge_pa_deg, rc.pa_deg)
-        bridge = {
-            "theta_deg": theta_deg,
-            "t_bridge_myr": t_bridge,
-            "sensitivity_dlnt_per_step": sensitivity,
-            "sensitivity_step_deg": cfg.bridge_theta_sensitivity_step_deg,
-            "validation": validation,
-        }
-    else:
-        print("[timescales] Section 4 (bridge) SKIPPED: bridge_dR_over_dV_kpc_per_kms not supplied in Config.")
+    # -------- 2.9 WSM epoch conversion --------
+    wsm = wsm_epoch_conversion(cfg, rc, sigma_profile.R_ring_kpc)
+
+    # -------- 2.5/2.6/2.7: the pair (computed before the adopted-age range,
+    # so a supplied pair-orbit theta=i estimate is eligible to contribute to
+    # it, not just ring turnaround/void/WSM) --------
+    pair_linear = pair_separation_linear(cfg, rc)
+    pair_orbit = pair_orbit_report(cfg, rc, target_t_myr=t_ring_turnaround)
+    debris = debris_free_expansion_test(cfg, rc)
+
+    # -------- headline quantities, then the adopted age range they define --------
+    quantities = {
+        "ring_turnaround": _q(t_ring_turnaround, "Myr", "estimate",
+                               "T_kappa(R_ring)/2; lower limit relative to the stellar (collisionless) prediction"),
+        "void_interaction_upper_limit": _q(void.t_interaction_myr, "Myr", "upper_limit",
+                                            "constant dtheta (Wallin & Struck-Marcell 1994 Sec 3.3.3: the hole keeps expanding)"),
+        "wsm_eps_R_ring_f_lo": _q(wsm["eps_equals_R_ring"][f"t_WSM_f{cfg.wsm_epochs[0]}_myr"], "Myr", "estimate",
+                                  f"f={cfg.wsm_epochs[0]}, eps=R_ring (Wallin & Struck-Marcell 1994 Sec 4.2)"),
+        "wsm_eps_R_ring_f_hi": _q(wsm["eps_equals_R_ring"][f"t_WSM_f{cfg.wsm_epochs[-1]}_myr"], "Myr", "estimate",
+                                  f"f={cfg.wsm_epochs[-1]}, eps=R_ring (Wallin & Struck-Marcell 1994 Sec 4.2)"),
+    }
+    if pair_orbit is not None:
+        quantities["pair_orbit_theta_i"] = _q(
+            pair_orbit["t_at_theta_i_myr"], "Myr", "estimate",
+            f"radial orbit, theta=i, r_peri={cfg.r_peri_kpc} kpc (Wallin & Struck-Marcell 1994 Table 1)")
+
+    adopted = _adopted_age_range(quantities)
+    adopted_mid_myr = None
+    if adopted is not None:
+        adopted_mid_myr = 0.5 * (adopted["lo_myr"] + adopted["hi_myr"])
+        print(f"[timescales] Adopted age range: {adopted['lo_myr']:.1f} ({adopted['lo_source']}) - "
+              f"{adopted['hi_myr']:.1f} Myr ({adopted['hi_source']}); midpoint {adopted_mid_myr:.1f} Myr "
+              "used for the shear-angle report.")
+
+    # -------- 2.4 disk shear --------
+    shear = disk_shear_timescale(cfg, rc, adopted_age_myr=adopted_mid_myr)
+
+    if pair_linear is not None:
+        quantities["pair_linear_naive_theta45"] = _q(
+            pair_linear["t_naive_theta45_myr"], "Myr", "estimate", "theta=45 deg assumed (naive, cot(45)=1)")
+        quantities["pair_linear_disk_normal_theta_i"] = _q(
+            pair_linear["t_disk_normal_theta_i_myr"], "Myr", "estimate",
+            "theta=i (disk-normal); requires bridge PA ~ phi+90 (orientation check)")
+    if pair_orbit is not None:
+        # pair_orbit_theta_i was already added above, before the adopted-age
+        # range was computed, so it's eligible to contribute to it.
+        if pair_orbit["theta_v_eq_vesc_deg"] is not None:
+            i_cross = int(np.argmin(np.abs(pair_orbit["theta_grid_deg"] - pair_orbit["theta_v_eq_vesc_deg"])))
+            quantities["pair_orbit_bound_lower_limit"] = _q(
+                float(pair_orbit["t_grid_myr"][i_cross]), "Myr", "upper_limit",
+                f"v=v_esc at theta={pair_orbit['theta_v_eq_vesc_deg']:.1f} deg -- t is a LOWER bound if the pair is bound "
+                "(smaller theta is unbound, larger theta is a longer, still-bound orbit)")
+    if debris is not None:
+        quantities["debris_t"] = _q(debris["t_debris_myr_REJECTED"], "Myr", "rejected",
+                                     f"free-expansion gradients differ by a factor of {debris['ratio']:.2f} -- not a clock")
+    quantities["radial_oscillation_exclusion_delta_chi2"] = _q(
+        exclusion["delta_chi2"], "dimensionless", "exclusion",
+        "delta_chi2 of the null V_rad=0 vs. the 2-parameter (V0,t) epicyclic grid minimum")
 
     results = {
+        "trm_dir": str(cfg.trm_dir), "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.__dict__.items()},
+        "nfw_verification": nfw_check,
         "rotation_curve": {
-            "radii_kpc": rc.radii_kpc.tolist(),
-            "v_kms": rc.v_kms.tolist(),
-            "v_err_lo_kms": rc.v_err_lo.tolist(),
-            "v_err_hi_kms": rc.v_err_hi.tolist(),
-            "inc_deg": rc.inc_deg,
-            "pa_deg": rc.pa_deg,
-            "kpc_per_arcsec": rc.kpc_per_arcsec,
+            "radii_kpc": rc.radii_kpc.tolist(), "v_kms": rc.v_kms.tolist(),
+            "v_err_lo_kms": rc.v_err_lo.tolist(), "v_err_hi_kms": rc.v_err_hi.tolist(),
+            "inc_deg": rc.inc_deg, "pa_deg": rc.pa_deg, "kpc_per_arcsec": rc.kpc_per_arcsec,
         },
         "radial_velocities": {
-            "ring_index": rv.ring_index.tolist(),
-            "radii_kpc": rv.radii_kpc.tolist(),
-            "s1_raw_kms": rv.s1_raw_kms.tolist(),
-            "v_R_outward_kms": rv.v_R_outward_kms.tolist(),
+            "ring_index": rv.ring_index.tolist(), "radii_kpc": rv.radii_kpc.tolist(),
+            "s1_raw_kms": rv.s1_raw_kms.tolist(), "v_R_outward_kms": rv.v_R_outward_kms.tolist(),
             "sigma_kms": rv.sigma_kms.tolist(),
         },
+        "sigma_hi_profile": {
+            "R_kpc": sigma_profile.R_kpc.tolist(), "R_edges_kpc": sigma_profile.R_edges_kpc.tolist(),
+            "sigma": sigma_profile.sigma.tolist(), "sigma_err": sigma_profile.sigma_err.tolist(),
+            "n_pix": sigma_profile.n_pix.tolist(), "R_ring_kpc": sigma_profile.R_ring_kpc,
+            "R_ring_arcsec": sigma_profile.R_ring_arcsec, "R_ring_err_kpc": sigma_profile.R_ring_err_kpc,
+            "ring_index": sigma_profile.ring_index, "annulus_width_arcsec": sigma_profile.annulus_width_arcsec,
+        },
         "per_ring_clocks": {
-            "radii_kpc": rc.radii_kpc.tolist(),
-            "T_phi_myr": T_phi_ring.tolist(),
-            "T_kappa_myr": T_kappa_ring.tolist(),
-            "T_kappa_half_myr": T_kappa_half_ring.tolist(),
+            "radii_kpc": rc.radii_kpc.tolist(), "T_phi_myr": T_phi_ring.tolist(),
+            "T_kappa_myr": T_kappa_ring.tolist(), "T_kappa_half_myr": T_kappa_half_ring.tolist(),
+            "dv_dR_km_s_kpc": dv_dR_ring.tolist(),
         },
+        "ring_turnaround": {"t_myr": t_ring_turnaround, "t_err_myr": t_ring_turnaround_err,
+                             "R_ring_kpc": sigma_profile.R_ring_kpc, "R_ring_err_kpc": sigma_profile.R_ring_err_kpc},
         "void": {
-            "r_avg_kpc": void.r_avg_kpc,
-            "dtheta_deg": void.dtheta_deg,
-            "fraction_of_orbit": void.fraction_of_orbit,
-            "v_c_void_kms": void.v_c_void_kms,
-            "T_phi_void_myr": void.T_phi_void_myr,
+            "r_avg_kpc": void.r_avg_kpc, "dtheta_deg": void.dtheta_deg, "fraction_of_orbit": void.fraction_of_orbit,
+            "v_c_void_kms": void.v_c_void_kms, "T_phi_void_myr": void.T_phi_void_myr,
             "t_interaction_myr_UPPER_LIMIT": void.t_interaction_myr,
-            "caveat": "Wallin & Struck-Marcell (1994) Sec 3.3.3: the hole continues to "
-                      "expand after formation; assuming constant dtheta makes this an "
-                      "upper limit on the true interaction time, not a measurement.",
-            "legacy_r_avg_kpc": void.legacy_r_avg_kpc,
-            "legacy_dtheta_deg": void.legacy_dtheta_deg,
+            "nearest_measured_Vc_systematic": void_nearest_vc,
+            "legacy_r_avg_kpc": void.legacy_r_avg_kpc, "legacy_dtheta_deg": void.legacy_dtheta_deg,
         },
+        "disk_shear": shear,
+        "pair_separation_linear": pair_linear,
+        "pair_orbit": pair_orbit,
+        "debris": debris,
         "epicyclic_grid": {
-            "alpha_fixed": cfg.alpha,
-            "alpha_citation": "Wallin & Struck-Marcell (1994) Sec 3.1",
-            "chi2_min": grid.chi2_min,
-            "V0_at_chi2_min_kms": grid.V0_at_min,
-            "t_at_chi2_min_myr": grid.t_at_min,
-            "note": "chi2 minimum sits at V0->0 with t unconstrained (Section 3.1); "
-                    "not a measurement -- see V0 upper limit instead.",
+            "alpha_fixed": cfg.alpha, "chi2_min": grid.chi2_min,
+            "V0_at_chi2_min_kms": grid.V0_at_min, "t_at_chi2_min_myr": grid.t_at_min,
         },
-        "V0_upper_limit": {
-            "t_range_myr": [cfg.t_estimate_lo_myr, cfg.t_estimate_hi_myr],
-            "cl": ul["cl"],
-            "V0_upper_limit_tightest_kms": ul["V0_upper_limit_tightest_kms"],
-            "t_at_tightest_myr": ul["t_at_tightest_myr"],
-        },
-        "bridge": bridge,
+        "radial_oscillation_exclusion": exclusion,
+        "wsm_epoch_conversion": wsm,
+        "adopted_age_range": adopted,
+        "quantities": quantities,
     }
     return results
+
+
+def build_summary_table(results: dict) -> list:
+    """Table 2 (Method, Observable, t [Myr], Type, Limiting assumption) --
+    generated directly from results["quantities"] (the same dict written to
+    timescales.json), never hand-typed."""
+    label_method = {
+        "ring_turnaround": ("Epicyclic (ring)", "T_kappa(R_ring)/2"),
+        "void_interaction_upper_limit": ("Crescent void", "T_phi * dtheta/360"),
+        "wsm_eps_R_ring_f_lo": ("WSM epoch (eps=R_ring)", f"f={results['wsm_epoch_conversion']['epochs'][0]}"),
+        "wsm_eps_R_ring_f_hi": ("WSM epoch (eps=R_ring)", f"f={results['wsm_epoch_conversion']['epochs'][-1]}"),
+        "pair_linear_naive_theta45": ("Pair separation (linear)", "theta=45 deg"),
+        "pair_linear_disk_normal_theta_i": ("Pair separation (linear)", "theta=i"),
+        "pair_orbit_theta_i": ("Pair orbit (galpy)", "radial infall, theta=i"),
+        "pair_orbit_bound_lower_limit": ("Pair orbit (galpy)", "v=v_esc bound"),
+        "debris_t": ("Debris expansion", "(dR/dV)*cot(i) [REJECTED]"),
+        "radial_oscillation_exclusion_delta_chi2": ("Radial-oscillation exclusion", "delta_chi2 (null vs. 2-param)"),
+    }
+    rows = []
+    for key, q in results["quantities"].items():
+        if q["unit"] != "Myr":
+            # Non-timescale exclusion diagnostics (e.g. delta_chi2) don't fit
+            # a "t [Myr]" column; they are reported by radial_oscillation_
+            # exclusion's own print statements and carried in the JSON
+            # instead, not forced into this table.
+            continue
+        method, observable = label_method.get(key, (key, ""))
+        rows.append({
+            "Method": method, "Observable": observable, "t [Myr]": q["value"],
+            "Type": q["type"], "Limiting assumption": q["assumption"],
+        })
+    disk_shear = results.get("disk_shear")
+    if disk_shear is not None:
+        rows.append({
+            "Method": "Disk shear", "Observable": "1/Delta_Omega (1 radian)",
+            "t [Myr]": disk_shear["t_shear_myr"], "Type": "upper_limit",
+            "Limiting assumption": "upper limit on coherent-material age over "
+                                    f"[{disk_shear['r_in_kpc']:.1f}, {disk_shear['r_out_kpc']:.1f}] kpc; "
+                                    "does not apply to the ring (a wave pattern)",
+        })
+    return rows
+
+
+def print_summary_table(rows: list):
+    if not rows:
+        print("[timescales] Summary table is empty.")
+        return
+    cols = list(rows[0].keys())
+    widths = {c: max(len(c), max(len(f"{r[c]:.2f}" if isinstance(r[c], float) else str(r[c])) for r in rows)) for c in cols}
+    header = "  ".join(c.ljust(widths[c]) for c in cols)
+    print("\n[timescales] Table 2 -- timescale summary:")
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        line = "  ".join(
+            (f"{r[c]:.2f}" if isinstance(r[c], float) else str(r[c])).ljust(widths[c]) for c in cols
+        )
+        print(line)
+
+
+def _json_default(o):
+    """json.dump's default= hook: converts numpy arrays/scalars and Path
+    objects (pair_orbit's grids in particular are left as ndarrays in the
+    results dict for direct use by the notebook's figures, only converted
+    here at the JSON boundary)."""
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    if isinstance(o, Path):
+        return str(o)
+    raise TypeError(f"Object of type {type(o)} is not JSON serializable: {o!r}")
 
 
 def write_results(cfg: Config, results: dict) -> Path:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     out_path = cfg.output_dir / "timescales.json"
     with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, indent=2, default=_json_default)
     print(f"[timescales] Wrote {out_path}")
     return out_path
 
@@ -688,30 +1509,20 @@ def write_results(cfg: Config, results: dict) -> Path:
 def main(cfg: Config) -> dict:
     results = run(cfg)
 
-    print(f"[timescales] Rotation curve from {cfg.ringlog_path}")
-    print(f"[timescales] kpc_per_arcsec = {results['rotation_curve']['kpc_per_arcsec']:.5f}")
-
-    print("\n[timescales] Void geometry:")
-    print(f"    R_avg   = {results['void']['r_avg_kpc']:.2f} kpc   (legacy: {results['void']['legacy_r_avg_kpc']:.2f} kpc)")
-    print(f"    dtheta  = {results['void']['dtheta_deg']:.2f} deg  (legacy: {results['void']['legacy_dtheta_deg']:.2f} deg)")
-    print(f"    t_interaction (UPPER LIMIT) = {results['void']['t_interaction_myr_UPPER_LIMIT']:.1f} Myr")
+    print(f"\n[timescales] Rotation curve from {cfg.ringlog_path}")
+    print(f"[timescales] R_ring = {results['sigma_hi_profile']['R_ring_kpc']:.2f} +/- "
+          f"{results['sigma_hi_profile']['R_ring_err_kpc']:.2f} kpc "
+          f"({results['sigma_hi_profile']['R_ring_arcsec']:.1f} arcsec, annulus {results['sigma_hi_profile']['ring_index']})")
 
     print("\n[timescales] Per-ring clocks (T_phi, T_kappa, T_kappa/2) [Myr]:")
     for R, tphi, tk, tkh in zip(
-        results["per_ring_clocks"]["radii_kpc"],
-        results["per_ring_clocks"]["T_phi_myr"],
-        results["per_ring_clocks"]["T_kappa_myr"],
-        results["per_ring_clocks"]["T_kappa_half_myr"],
+        results["per_ring_clocks"]["radii_kpc"], results["per_ring_clocks"]["T_phi_myr"],
+        results["per_ring_clocks"]["T_kappa_myr"], results["per_ring_clocks"]["T_kappa_half_myr"],
     ):
         print(f"    R={R:6.2f} kpc: T_phi={tphi:7.1f}  T_kappa={tk:7.1f}  T_kappa/2={tkh:7.1f}")
 
-    print(f"\n[timescales] Epicyclic grid: chi2_min={results['epicyclic_grid']['chi2_min']:.2f} "
-          f"at V0={results['epicyclic_grid']['V0_at_chi2_min_kms']:.1f} km/s, "
-          f"t={results['epicyclic_grid']['t_at_chi2_min_myr']:.1f} Myr (boundary/degenerate -- not a measurement)")
-    print(f"[timescales] V0 upper limit ({results['V0_upper_limit']['cl']:.0%} CL, "
-          f"t in {results['V0_upper_limit']['t_range_myr']} Myr): "
-          f"V0 <~ {results['V0_upper_limit']['V0_upper_limit_tightest_kms']:.1f} km/s "
-          f"at t={results['V0_upper_limit']['t_at_tightest_myr']:.1f} Myr")
+    rows = build_summary_table(results)
+    print_summary_table(rows)
 
     write_results(cfg, results)
     return results
@@ -745,16 +1556,8 @@ def selftest():
     rv = load_radial_velocities(results_dir, side=cfg.side)
 
     # ---------------- Test: inputs trace to the ringlog, kpc_per_arcsec ----------------
-    # Self-consistency, not a frozen snapshot: read the raw ringlog table
-    # directly and confirm load_rotation_curve's derived values match
-    # whatever the file currently contains (a re-run of the TRM fit changes
-    # these numbers -- see e.g. fixed_PA42's own revision history -- so
-    # this must never hardcode a specific run's output).
     raw = read_ringlog(ringlog_path)
     expected_kpc_per_arcsec = float(raw["r_center_kpc"][0] / (raw["r_in_arcsec"][0] + raw["r_out_arcsec"][0]) * 2.0)
-    # rc.kpc_per_arcsec is the mean across rings (read_ringlog.meta); a single
-    # row's own ratio can differ by up to read_ringlog's own rtol=1e-3
-    # cross-row consistency check, so compare at that tolerance, not exactly.
     check("kpc_per_arcsec derived from ringlog matches RAD(Kpc)/RAD(arcs) directly",
           abs(rc.kpc_per_arcsec - expected_kpc_per_arcsec) / expected_kpc_per_arcsec < 1e-3,
           f"(got {rc.kpc_per_arcsec:.5f}, row0 ratio={expected_kpc_per_arcsec:.5f})")
@@ -762,31 +1565,23 @@ def selftest():
           np.isclose(rc.radii_kpc[0], float(raw["r_center_kpc"][0]), atol=1e-9)
           and np.isclose(rc.v_kms[0], float(raw["VROT(km/s)"][0]), atol=1e-9),
           f"(R0={rc.radii_kpc[0]}, V0={rc.v_kms[0]})")
-
-    # ---------------- Test: sign flip on read ----------------
     check("v_R_outward is the sign-flipped s1 (v_R_outward == -s1)",
           np.allclose(rv.v_R_outward_kms, -rv.s1_raw_kms))
 
-    # ---------------- Test: void deprojection matches harmonic_fit.make_geometry ----------------
-    # void_geometry() calls deproject_pixel_offsets directly (the same core
-    # algebra make_geometry uses internally, see harmonic_fit.py). Confirm
-    # the two agree to 1e-9 by evaluating both at the same arbitrary pixel.
-    from harmonic_fit import make_geometry
+    from harmonic_fit import make_geometry as _make_geometry
     shape = (48, 48)
-    px, py = 31, 18  # an arbitrary integer pixel, away from the center
-    R_grid, th_grid = make_geometry(shape, rc.xpos_pix, rc.ypos_pix, rc.pa_deg, rc.inc_deg, -1)
+    px, py = 31, 18
+    R_grid, th_grid = _make_geometry(shape, rc.xpos_pix, rc.ypos_pix, rc.pa_deg, rc.inc_deg, -1)
     R_point, th_point = deproject_pixel_offsets(px - rc.xpos_pix, py - rc.ypos_pix, rc.pa_deg, rc.inc_deg, -1)
-    check("void deprojection (deproject_pixel_offsets) agrees with make_geometry to 1e-9",
+    check("void/R_ring deprojection agrees with make_geometry to 1e-9",
           abs(float(R_point) - R_grid[py, px]) < 1e-9 and abs(float(th_point) - th_grid[py, px]) < 1e-9)
 
-    # ---------------- Test: extrapolation warning fires ----------------
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         warn_if_extrapolating("test", np.array([1.0]), rc.radii_kpc.min(), rc.radii_kpc.max())
         fired = any("evaluating the rotation-curve fit" in str(wi.message) for wi in w)
-    check("extrapolation warning fires below the innermost knot", fired)
+    check("extrapolation warning fires below the innermost ring", fired)
 
-    # ---------------- Test: no optimiser -- grid chi2 matches independent scalar computation ----------------
     grid = epicyclic_chi2_grid(cfg, rv, rc)
     iv, it = 7, 33
     V0_test, t_test = grid.V0_grid_kms[iv], grid.t_grid_myr[it]
@@ -795,54 +1590,90 @@ def selftest():
         model = kick_model_v_R(R, t_test, V0_test, cfg.alpha, rc.curve, cfg.r_ref_kpc)
         manual += ((obs - model) / sig) ** 2
     check("vectorised grid chi2 matches an independent scalar computation (1e-6)",
-          abs(grid.chi2[iv, it] - manual) < 1e-6,
-          f"(grid={grid.chi2[iv, it]:.8f}, manual={manual:.8f})")
+          abs(grid.chi2[iv, it] - manual) < 1e-6, f"(grid={grid.chi2[iv, it]:.8f}, manual={manual:.8f})")
 
-    # ---------------- Test: reproduces the old (pegged) fit's RSS on the old fixture ----------------
-    # Historical fixture only -- NOT used anywhere in production Config, and
-    # deliberately using scipy's CubicSpline directly rather than
-    # generate_kinematic_curve: the RSS=179.47 being reproduced here was
-    # itself computed against the superseded notebook's natural-cubic-spline
-    # rotation curve, not the current weighted-polynomial default, so
-    # matching it requires the same (now-retired) interpolation method. This
-    # test's purpose is narrow -- confirm the kick-model formula itself is
-    # unchanged from the optimiser-based version, i.e. that removing
-    # curve_fit did not change the underlying model -- not to validate
-    # today's rotation-curve fit, which is covered by the tests above.
-    from scipy.interpolate import CubicSpline as _LegacyCubicSpline
-
-    legacy_radii = np.array([14.9, 18.2, 21.5, 24.8])
-    legacy_v = np.array([297.223, 295.973, 304.49, 307.541])
-    legacy_v_R = np.array([9.73993963, -0.81866769, -1.4475939, 13.23452213])
-    _legacy_spline = _LegacyCubicSpline(legacy_radii, legacy_v, bc_type="natural")
-    legacy_t, legacy_V0, legacy_alpha = 94.5, 10.0, 1.31
-
-    def _legacy_kick_model_v_R(R_kpc, t_myr, V0_kms, alpha, spline, r_ref_kpc, conversion_myr=CONVERSION_MYR):
-        dv_spline = spline.derivative()
-        v_c = spline(R_kpc)
-        dv_dR = dv_spline(R_kpc)
-        Omega = v_c / R_kpc
-        kappa = np.sqrt(2.0 * Omega**2 + 2.0 * Omega * dv_dR)
-        kappa_myr = kappa / conversion_myr
-        v_kick = V0_kms * (np.asarray(R_kpc, dtype=float) / r_ref_kpc) ** (-alpha)
-        return v_kick * np.sin(kappa_myr * t_myr)
-
-    legacy_model = _legacy_kick_model_v_R(legacy_radii, legacy_t, legacy_V0, legacy_alpha, _legacy_spline, cfg.r_ref_kpc)
-    legacy_rss = float(np.sum((legacy_v_R - legacy_model) ** 2))
-    check("grid model formula reproduces the old pegged-fit RSS (179.47, notebook printout)",
-          abs(legacy_rss - 179.47) < 0.05, f"(got {legacy_rss:.2f})")
-
-    # ---------------- Test: bridge worked example (91.7 -> 78.8 Myr) ----------------
-    ratio = 91.7 / CONVERSION_MYR  # implied by the naive (theta=45 deg) t=91.7 Myr result
+    ratio = 91.7 / CONVERSION_MYR
     t_naive = bridge_timescale_myr(ratio, 45.0)
     t_corrected = bridge_timescale_myr(ratio, 49.345)
-    check("bridge worked example: naive (theta=45) reproduces 91.7 Myr",
-          abs(t_naive - 91.7) < 0.05, f"(got {t_naive:.2f})")
-    check("bridge worked example: corrected (theta=i=49.345) gives 78.8 Myr",
-          abs(t_corrected - 78.8) < 0.1, f"(got {t_corrected:.2f})")
+    check("pair-separation worked example: naive (theta=45) reproduces 91.7 Myr", abs(t_naive - 91.7) < 0.05, f"(got {t_naive:.2f})")
+    check("pair-separation worked example: corrected (theta=i=49.345) gives 78.8 Myr", abs(t_corrected - 78.8) < 0.1, f"(got {t_corrected:.2f})")
     sens = bridge_timescale_sensitivity(49.345, 5.0)
-    check("bridge sensitivity: ~18% per 5 deg near i=49 deg",
-          abs(sens - 0.18) < 0.01, f"(got {sens:.3f})")
+    check("pair-separation sensitivity: ~18% per 5 deg near i=49 deg", abs(sens - 0.18) < 0.01, f"(got {sens:.3f})")
+
+    # ================= Section 4: new acceptance tests =================
+
+    # ---- 1. All four galpy verification assertions pass ----
+    try:
+        nfw_result = verify_nfw_potential(cfg)
+        check("1. All four galpy NFW verification assertions pass", True,
+              f"(a={nfw_result['a_kpc']:.3f} kpc, r200={nfw_result['r200_kpc']:.3f} kpc)")
+    except RuntimeError as e:
+        check("1. All four galpy NFW verification assertions pass", False, f"({e})")
+
+    # ---- 2. Pot.mass(r200) == M200 to 1e-6 relative ----
+    pot, Ms, a, r200 = build_nfw_potential(cfg)
+    m200_check = float(pot.mass(r200))
+    rel_m200 = abs(m200_check - cfg.M200_Msun) / cfg.M200_Msun
+    check("2. Pot.mass(r_200) == M_200 to 1e-6 relative", rel_m200 < 1e-6, f"(rel diff={rel_m200:.2e})")
+
+    # ---- 3. Quadrature vs. galpy Orbit integration agree to 1% ----
+    r_now_test, v_now_test, r_peri_test = 80.0, 150.0, 12.0
+    t_quad = orbit_time_quadrature_myr(pot, r_peri_test, r_now_test, v_now_test)
+    t_orbit = orbit_time_via_galpy_orbit_myr(pot, r_peri_test, r_now_test, v_now_test, cfg.galpy_ro_kpc, cfg.galpy_vo_kms)
+    rel_orbit = abs(t_orbit - t_quad) / t_quad
+    check("3. Quadrature vs. galpy Orbit integration agree to 1%", rel_orbit < 0.01,
+          f"(quad={t_quad:.2f} Myr, orbit={t_orbit:.2f} Myr, rel diff={rel_orbit:.2e})")
+
+    # ---- 4. r_peri -> r_now gives t -> 0 ----
+    t_degenerate = orbit_time_quadrature_myr(pot, r_now_test - 1e-6, r_now_test, v_now_test)
+    check("4. In the limit r_peri -> r_now, t -> 0", t_degenerate < 1e-3, f"(got {t_degenerate:.6f} Myr)")
+    t_equal = orbit_time_quadrature_myr(pot, r_now_test, r_now_test, v_now_test)
+    check("4b. r_peri == r_now gives t == 0 exactly", t_equal == 0.0, f"(got {t_equal})")
+
+    # ---- 5. Kepler potential reproduces the analytic radial free-fall time ----
+    from galpy.potential import KeplerPotential
+    M_kepler = 1e11 * u.Msun
+    pot_kepler = KeplerPotential(amp=M_kepler, ro=cfg.galpy_ro_kpc * u.kpc, vo=cfg.galpy_vo_kms * u.km / u.s)
+    r_now_k, r_peri_k = 50.0, 5.0
+    phi_now_k = potential_kms2(pot_kepler, r_now_k)[0]
+    v_now_k = float(np.sqrt(-2.0 * phi_now_k))  # E=0, parabolic infall
+    t_quad_k = orbit_time_quadrature_myr(pot_kepler, r_peri_k, r_now_k, v_now_k)
+    GM = (G * M_kepler).to(u.kpc**3 / u.Myr**2)
+    t_analytic_k = ((2.0 / 3.0) * np.sqrt(1.0 / (2.0 * GM)) * ((r_now_k * u.kpc) ** 1.5 - (r_peri_k * u.kpc) ** 1.5)).to(u.Myr).value
+    rel_k = abs(t_quad_k - t_analytic_k) / t_analytic_k
+    check("5. Kepler potential reproduces the analytic parabolic free-fall time", rel_k < 1e-4,
+          f"(quad={t_quad_k:.3f} Myr, analytic={t_analytic_k:.3f} Myr, rel diff={rel_k:.2e})")
+
+    # ---- 6. theta=45 deg reproduces the naive R/V value to 1e-9 ----
+    R_test, V_test = 40.0, 80.0
+    t_naive_rv = (R_test / V_test) * CONVERSION_MYR
+    t_theta45 = bridge_timescale_myr(R_test / V_test, 45.0)
+    check("6. theta=45 deg reproduces the naive R/V value to 1e-9", abs(t_theta45 - t_naive_rv) < 1e-9 * max(t_naive_rv, 1.0),
+          f"(naive={t_naive_rv:.6f}, theta45={t_theta45:.6f})")
+
+    # ---- 7. Every ring parameter traces to the ringlog (spot check disk shear defaults) ----
+    shear_default = disk_shear_timescale(cfg, rc)
+    check("7. Disk shear r_in/r_out default to the ringlog's own min/max radius (no literal)",
+          np.isclose(shear_default["r_in_kpc"], rc.radii_kpc.min()) and np.isclose(shear_default["r_out_kpc"], rc.radii_kpc.max()),
+          f"(r_in={shear_default['r_in_kpc']:.2f}, r_out={shear_default['r_out_kpc']:.2f}, "
+          f"ringlog min/max={rc.radii_kpc.min():.2f}/{rc.radii_kpc.max():.2f})")
+
+    # ---- 8. dV_sys computed from the table matches the value used everywhere ----
+    test_table = {"A": (4677.0, "this galaxy, Barolo VSYS"), "B": (4884.0, "synthetic companion, test fixture")}
+    dV_direct = compute_dV_sys(test_table, "A", "B")
+    cfg_pair_test = Config(
+        trm_dir=trm_dir, ringlog_path=ringlog_path, results_dir=results_dir,
+        vsys_table_kms=test_table, vsys_pair_label_a="A", vsys_pair_label_b="B",
+        R_sep_kpc=50.0, bridge_pa_deg=None,
+    )
+    pair_lin_test = pair_separation_linear(cfg_pair_test, rc)
+    check("8. dV_sys computed from the table matches the value used in pair_separation_linear",
+          pair_lin_test is not None and abs(pair_lin_test["dV_sys_kms"] - dV_direct) < 1e-9,
+          f"(direct={dV_direct}, used={pair_lin_test['dV_sys_kms'] if pair_lin_test else None})")
+    pair_orbit_test = pair_orbit_report(cfg_pair_test, rc)
+    check("8b. dV_sys computed from the table matches the value used in pair_orbit_report",
+          pair_orbit_test is not None and abs(pair_orbit_test["dV_sys_kms"] - dV_direct) < 1e-9,
+          f"(direct={dV_direct}, used={pair_orbit_test['dV_sys_kms'] if pair_orbit_test else None})")
 
     print(f"\n[selftest] {n_pass} passed, {n_fail} failed")
     return n_fail == 0
@@ -852,7 +1683,7 @@ if __name__ == "__main__":
     import argparse
 
     repo_root = Path(__file__).parent
-    parser = argparse.ArgumentParser(description="Epicyclic timescales for the observed HI void.")
+    parser = argparse.ArgumentParser(description="Every dynamical/interaction timescale quoted in the paper.")
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--trm-dir", default="fixed_PA42")
     args = parser.parse_args()
