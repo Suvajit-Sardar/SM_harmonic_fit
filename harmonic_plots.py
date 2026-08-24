@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 from pathlib import Path
 
 import matplotlib as mpl
@@ -97,6 +98,9 @@ class Results:
         self.primary_weighting = self.table.meta["primary_weighting"]
         self.kpc_per_arcsec = self.table.meta["kpc_per_arcsec"]
         self.n_rings = int(np.max(self.table["ring_index"])) + 1
+
+        residual_structure_path = results_dir / "residual_structure.json"
+        self.residual_structure = json.loads(residual_structure_path.read_text()) if residual_structure_path.is_file() else None
 
     def rows(self, ring_index=None, side=None, weighting=None):
         t = self.table
@@ -624,6 +628,215 @@ def fig_vrad_profile(res: Results):
 
 
 # --------------------------------------------------------------------------
+# Azimuthal-modulation test figures (does the axisymmetric sin(theta) fit
+# suppress a genuinely modulated V_rad? -- harmonic_fit.py's process_ring /
+# vr1_theta1_from_c2s2 / inclination_scan_vr1 / residual_autocorrelation)
+# --------------------------------------------------------------------------
+
+
+def fig_m1_modulation(res: Results, n_wedge: int = AZIMUTHAL_N_WEDGE, min_abs_sin_theta: float = 0.15):
+    """Test 1's headline figure: V_rad(theta) = s1 + V_r1*cos(theta-theta_1)
+    (the modulation test's own fit, side="both", primary weighting) drawn
+    as a curve over azimuth, with the binned per-sector empirical estimate
+    overlaid: (weighted-mean dv_prefit in the wedge - c0) / sin(theta_wedge),
+    using this ring's 4-term c0. A clean modulated flow should show a curve
+    swinging well away from zero whose mean (s1) is near zero -- the
+    suppression, shown directly.
+
+    Wedges within min_abs_sin_theta of the major axis are dropped rather
+    than shown with inflated error bars: V_rad has essentially no leverage
+    there (same reasoning as this project's "do not fit V_rad in narrow
+    sectors" rule -- this is binning for display, not a refit, but the
+    same 1/sin(theta) blow-up applies to a per-wedge empirical estimate).
+    """
+    fig, axes = plt.subplots(1, res.n_rings, figsize=(6 * res.n_rings, 5.5), sharey=False)
+    if res.n_rings == 1:
+        axes = [axes]
+
+    theta_edges = np.linspace(0, 360, n_wedge + 1)
+
+    for i, ax in enumerate(axes):
+        theta = res.maps[f"ring{i}_theta"]
+        mask = res.maps[f"ring{i}_ring_mask_both"]
+        w = res.maps[f"ring{i}_weights_primary"]
+        dv_pre = res.maps[f"ring{i}_dv_prefit"]
+        row = res.row(i)
+        c0, s1, V_r1, theta_1_deg = row["c0"], row["s1"], row["V_r1"], row["theta_1"]
+        rms_residual = row["rms_residual"]
+
+        theta_deg = np.degrees(theta) % 360.0
+        vrad_pts = np.full(n_wedge, np.nan)
+        vrad_err = np.full(n_wedge, np.nan)
+        theta_plot = np.full(n_wedge, np.nan)
+
+        for j in range(n_wedge):
+            wedge = mask & (theta_deg >= theta_edges[j]) & (theta_deg < theta_edges[j + 1])
+            if not np.any(wedge):
+                continue
+            wv = w[wedge]
+            wsum = np.sum(wv)
+            if wsum <= 0:
+                continue
+            theta_w = np.degrees(np.arctan2(np.sum(wv * np.sin(theta[wedge])),
+                                             np.sum(wv * np.cos(theta[wedge])))) % 360.0
+            sin_tw = np.sin(np.radians(theta_w))
+            if abs(sin_tw) < min_abs_sin_theta:
+                continue
+            dv_mean = np.sum(wv * dv_pre[wedge]) / wsum
+            n_beams = max(np.sum(wedge) / row["pixels_per_beam"], 1.0)
+            vrad_pts[j] = (dv_mean - c0) / sin_tw
+            vrad_err[j] = (rms_residual / abs(sin_tw)) / np.sqrt(n_beams)
+            theta_plot[j] = theta_w
+
+        valid = np.isfinite(theta_plot)
+        theta_c_shift = np.where(theta_plot < 90, theta_plot + 360, theta_plot)
+        order = np.argsort(np.where(valid, theta_c_shift, np.inf))
+
+        ax.errorbar(theta_c_shift[order], vrad_pts[order], yerr=vrad_err[order], fmt="o", color="black",
+                    mfc="none", capsize=3, label=f"binned data ($|\\sin\\theta|$ > {min_abs_sin_theta})", zorder=5)
+
+        theta_smooth_deg = np.linspace(0, 360, 400)
+        theta_smooth_shift = np.where(theta_smooth_deg < 90, theta_smooth_deg + 360, theta_smooth_deg)
+        order_s = np.argsort(theta_smooth_shift)
+        vrad_model = s1 + V_r1 * np.cos(np.radians(theta_smooth_deg - theta_1_deg))
+        ax.plot(theta_smooth_shift[order_s], vrad_model[order_s], "-", color=RING_COLORS[i % len(RING_COLORS)],
+                 linewidth=2, label=r"$s_1+V_{r1}\cos(\theta-\theta_1)$", zorder=3)
+
+        ax.axhline(0, color="gray", linestyle=":", linewidth=1)
+        ax.axhline(s1, color=RING_COLORS[i % len(RING_COLORS)], linestyle="--", linewidth=1, alpha=0.6,
+                   label=f"$s_1$={s1:.1f} km/s")
+        ax.axvspan(90, 270, facecolor="#F7F8FF", alpha=0.6, zorder=0)
+        ax.axvspan(270, 450, facecolor="#FFF7F7", alpha=0.6, zorder=0)
+        ax.set_xlim(90, 450)
+        ticks = np.arange(90, 451, 90)
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{t if t <= 360 else t - 360}" for t in ticks])
+        ax.set_xlabel(r"Azimuth [$^{\circ}$]")
+        if i == 0:
+            ax.set_ylabel(r"$V_{\rm rad}(\theta)$ [km s$^{-1}$]")
+        ax.set_title(f"ring {i}: $V_{{r1}}$={V_r1:.1f} km/s, $\\theta_1$={theta_1_deg:.0f}$^\\circ$")
+        ax.legend(fontsize=9, loc="upper right")
+        ax.xaxis.set_minor_locator(AutoMinorLocator(3))
+
+    fig.suptitle(f"Test 1: recovered V_rad(theta) modulation from c2, s2 {res.caption_tag()}")
+    fig.tight_layout()
+    return fig
+
+
+def fig_theta1_compass(res: Results, void_azimuth_deg=None, companion_azimuth_deg=None):
+    """Polar compass of theta_1 (the m=2 signal's phase) per ring. Takes
+    void_azimuth_deg / companion_azimuth_deg as plain floats rather than
+    reading them from results/: computing the void's azimuth needs FITS/WCS
+    access (timescales.py's void geometry), which this module deliberately
+    never touches (CLAUDE.md: no astropy.io.fits in harmonic_plots.py) --
+    the notebook computes them and passes them in, same pattern as the c0
+    toggle figures taking two Results objects instead of reading a second
+    tree itself."""
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(projection="polar"))
+    ax.set_theta_zero_location("E")
+    ax.set_theta_direction(1)
+
+    sub = res.rows(side="both", weighting=res.primary_weighting)
+    sub = sub[np.argsort(sub["ring_index"])]
+    rmax = float(np.max(sub["V_r1"])) * 1.15 if len(sub) else 1.0
+    ax.set_rmax(rmax)
+
+    for row in sub:
+        th = np.radians(row["theta_1"])
+        err = np.radians(row["theta_1_err"]) if np.isfinite(row["theta_1_err"]) else 0.0
+        r = row["V_r1"]
+        color = RING_COLORS[int(row["ring_index"]) % len(RING_COLORS)]
+        ax.plot([th, th], [0, r], color=color, linewidth=2,
+                label=f"ring {int(row['ring_index'])}: $\\theta_1$={row['theta_1']:.0f}$^\\circ$, "
+                      f"$V_{{r1}}$={r:.0f} km/s")
+        ax.plot(th, r, "o", color=color, markeredgecolor="black", zorder=5)
+        if err > 0:
+            ax.fill_betweenx([0, r], th - err, th + err, color=color, alpha=0.15)
+
+    if void_azimuth_deg is not None:
+        th_v = np.radians(void_azimuth_deg)
+        ax.plot([th_v, th_v], [0, rmax], color="black", linestyle="--", linewidth=2, label="void azimuth")
+    if companion_azimuth_deg is not None:
+        th_c = np.radians(companion_azimuth_deg)
+        ax.plot([th_c, th_c], [0, rmax], color="purple", linestyle=":", linewidth=2, label="companion direction")
+
+    ax.set_title(f"theta_1 compass -- phase of the m=2 (V_r1) signal per ring {res.caption_tag()}", pad=20)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.05, 1.05), fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def fig_residual_autocorr(res: Results):
+    """Test 2.1: azimuthally averaged autocorrelation for the pre-fit and
+    post-fit residual maps, with the beam FWHM marked. Pure (beam-
+    correlated) noise gives L_corr/beam ~= 0.75, not 1:1 -- see
+    harmonic_fit.residual_autocorrelation's docstring and selftest Test 11
+    for why (a Gaussian beam's autocorrelation is itself Gaussian with
+    std sigma*sqrt(2), so its HWHM is sqrt(2)/2 of the beam's FWHM, not
+    equal to it). L_corr well above that reproducible baseline means
+    spatially coherent structure the harmonic model hasn't captured."""
+    if res.residual_structure is None:
+        raise RuntimeError("fig_residual_autocorr: results/residual_structure.json not found -- "
+                            "re-run harmonic_fit.main() (it writes this file) first.")
+    rs = res.residual_structure
+    beam_fwhm = rs["beam_fwhm_geomean_arcsec"]
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    for key, label, color in (("prefit", "pre-fit", "crimson"), ("postfit", "post-fit", "navy")):
+        d = rs["autocorrelation"][key]
+        lag = np.asarray(d["lag_arcsec"])
+        acf = np.asarray(d["radial_acf"])
+        acf_norm = acf / d["acf0"]
+        ax.plot(lag, acf_norm, "-o", color=color, markersize=3,
+                label=f"{label} (L_corr={d['L_corr_arcsec']:.2f}\", ratio to beam={d['L_corr_arcsec']/beam_fwhm:.2f})")
+
+    ax.axhline(0.5, color="gray", linestyle=":", linewidth=1)
+    ax.axvline(beam_fwhm, color="black", linestyle="--", linewidth=1.5, label=f"beam FWHM = {beam_fwhm:.2f}\"")
+    ax.set_xlim(0, beam_fwhm * 4)
+    ax.set_xlabel("Lag [arcsec]")
+    ax.set_ylabel("Normalised azimuthally-averaged ACF")
+    ax.legend(fontsize=10)
+    ax.set_title(f"Test 2.1: residual autocorrelation, pre-fit vs. post-fit {res.caption_tag()}")
+    fig.tight_layout()
+    return fig
+
+
+def fig_inclination_scan(res: Results):
+    """Test 1.3 discriminant: chi2(inc, V_r1) contours, same style as
+    fig_pa_degeneracy. If V_r1 can be driven to zero within a plausible
+    inclination error, the m=2 signal could be an inclination-error
+    artifact (Schoenmakers, Franx & de Zeeuw 1997) rather than a modulated
+    radial flow; if it cannot, it isn't."""
+    fig, axes = plt.subplots(1, res.n_rings, figsize=(5.5 * res.n_rings, 5))
+    if res.n_rings == 1:
+        axes = [axes]
+
+    for i, ax in enumerate(axes):
+        inc_grid = res.scans[f"ring{i}_inc_inc_grid_deg"]
+        vr1_grid = res.scans[f"ring{i}_inc_vr1_grid_kms"]
+        chi2_grid = res.scans[f"ring{i}_inc_chi2_grid"]
+        chi2_min = np.min(chi2_grid)
+        delta = chi2_grid - chi2_min
+
+        X, Y = np.meshgrid(inc_grid, vr1_grid, indexing="ij")
+        cs = ax.contourf(X, Y, delta, levels=[0, 1, 4, 9, delta.max() if delta.max() > 9 else 10],
+                          cmap="viridis_r", alpha=0.85)
+        ax.contour(X, Y, delta, levels=[1, 4, 9], colors="white", linewidths=0.8)
+
+        inc0 = float(res.scans[f"ring{i}_inc_inc0_deg"])
+        ax.axvline(inc0, color="red", linestyle=":", linewidth=1.5, label="fiducial INC")
+        ax.set_xlabel("Inclination [deg]")
+        if i == 0:
+            ax.set_ylabel(r"$V_{r1}$ [km s$^{-1}$]")
+        ax.set_title(f"ring {i}")
+        ax.legend(fontsize=9, loc="upper right")
+
+    fig.colorbar(cs, ax=axes, label=r"$\Delta\chi^2$", fraction=0.02, pad=0.02)
+    fig.suptitle(f"Inclination-$V_{{r1}}$ degeneracy, delta chi2 = 1,4,9 (rescaled to chi2_min/n_eff=1) {res.caption_tag()}")
+    return fig
+
+
+# --------------------------------------------------------------------------
 # main()
 # --------------------------------------------------------------------------
 
@@ -632,6 +845,9 @@ ALL_FIGURES = [
     ("fig_coverage", fig_coverage),
     ("fig_residual_maps", fig_residual_maps),
     ("fig_azimuthal_vlos", functools.partial(fig_azimuthal_vlos, n_wedge=AZIMUTHAL_N_WEDGE)),
+    ("fig_m1_modulation", fig_m1_modulation),
+    ("fig_residual_autocorr", fig_residual_autocorr),
+    ("fig_inclination_scan", fig_inclination_scan),
     ("fig_pa_degeneracy", fig_pa_degeneracy),
     ("fig_vsys_degeneracy", fig_vsys_degeneracy),
     ("fig_s1_vs_pa", fig_s1_vs_pa),

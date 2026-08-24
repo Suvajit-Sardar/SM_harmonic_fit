@@ -417,6 +417,32 @@ def void_geometry(cfg: Config, rc: RotationCurve, header, cdelt1_sign: int) -> V
     )
 
 
+def void_azimuth_in_disk_frame(cfg: Config, rc: RotationCurve, header, cdelt1_sign: int) -> float:
+    """harmonic_fit.py-style azimuthal-modulation Test 1.4: the void's mean
+    azimuth in the SAME theta frame harmonic_fit.py's ring fits use --
+    relative to the disc's dynamical center (rc.xpos_pix, rc.ypos_pix), NOT
+    the void-centered frame void_geometry() uses for R_avg/dtheta. theta is
+    origin-dependent (deproject_pixel_offsets), and comparing against a
+    ring's recovered theta_1 (harmonic_fit.vr1_theta1_from_c2s2) requires
+    the disc's own center -- void_geometry() deliberately keeps the void's
+    own center for R_avg/dtheta (see its docstring), so this is a separate,
+    second evaluation of the same top/bottom corners, not a duplicate
+    deprojection implementation (still routed through
+    harmonic_fit.deproject_pixel_offsets).
+
+    Returns degrees in [0, 360): the circular mean of the void's top/bottom
+    corner azimuths (bisecting the shorter arc between them).
+    """
+    ra_t, dec_t = _radec_deg(cfg.void_top_hms)
+    ra_b, dec_b = _radec_deg(cfg.void_bottom_hms)
+    x_t, y_t = radec_to_pixel(header, ra_t, dec_t)
+    x_b, y_b = radec_to_pixel(header, ra_b, dec_b)
+    _, theta_t = deproject_pixel_offsets(x_t - rc.xpos_pix, y_t - rc.ypos_pix, rc.pa_deg, rc.inc_deg, cdelt1_sign)
+    _, theta_b = deproject_pixel_offsets(x_b - rc.xpos_pix, y_b - rc.ypos_pix, rc.pa_deg, rc.inc_deg, cdelt1_sign)
+    mean_theta = np.arctan2(np.sin(theta_t) + np.sin(theta_b), np.cos(theta_t) + np.cos(theta_b))
+    return float(np.degrees(mean_theta) % 360.0)
+
+
 # --------------------------------------------------------------------------
 # 3. Epicyclic ("kick") grid search -- no optimiser
 # --------------------------------------------------------------------------

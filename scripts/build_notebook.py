@@ -263,6 +263,169 @@ direct, quantitative sign that this ring's masked coverage breaks the
 """)
 
     md(r"""
+## Is the null V_rad caused by azimuthal averaging?
+
+`V_rad` (`s1`) came out consistent with zero in every ring. Two explanations
+are compatible with that: (A) there is genuinely no coherent radial motion,
+or (B) there is radial motion whose amplitude and sign vary with azimuth, so
+the axisymmetric `sin(theta)` fit averages it toward zero. Wallin &
+Struck-Marcell (1994) predict exactly (B) for an off-centre collision like
+the one proposed for this system: their eq. (16) modulates the ring's
+radial-flow amplitude with azimuth, `Sec 3.4` reports a ring thickness that
+varies with azimuth in all three of their methods, and their Fig. 6 shows
+infalling and outflowing particles coexisting in the ring at a single epoch.
+
+**Test 1** recovers the `m=1` azimuthal modulation from the second-order
+harmonic terms. Expanding `V_rad(theta) = V_r0 + V_r1*cos(theta - theta_1)`'s
+contribution to the fit shows it appears as `c0`, `s1`, `c2`, `s2`:
+
+```
+V_r1    = 2*sqrt(c2^2 + s2^2)
+theta_1 = arctan2(-c2, s2)
+c0     += V_r1*sin(theta_1)/2   =  -c2   (a built-in consistency check)
+```
+
+Hypothesis (B) predicts `s1 ~ 0` with `V_r1` large, and `theta_1` roughly
+consistent across rings (a single impact defines one preferred azimuth).
+`c2`, `s2` are not unique to a modulated flow, though -- an inclination
+error, an oval distortion, or a warp can all produce them (Schoenmakers,
+Franx & de Zeeuw 1997) -- so a `V_r1` detection alone is not proof; the
+inclination scan below is the discriminant.
+
+**Test 2** asks whether the residual scatter is noise or structure. The
+primary check needs no noise model: pure beam-correlated noise has a
+reproducible autocorrelation length (`L_corr`); spatially coherent structure
+the model hasn't captured pushes `L_corr` above that baseline.
+
+All of this reuses machinery already in the pipeline (`design_matrix`
+already supports `c2`, `s2`; `pa_scan`/`vsys_scan`'s grid-and-freeze-the-mask
+pattern; `block_bootstrap_s1`, generalised). See `harmonic_fit.py`'s
+azimuthal-modulation block in `process_ring` and its self-tests 8-12.
+""")
+
+    code(r"""
+sub_mod = res.rows(side="both", weighting=res.primary_weighting)
+sub_mod = sub_mod[np.argsort(sub_mod["ring_index"])]
+sub_mod["ring_index", "s1", "c2", "s2", "V_r1", "V_r1_boot_lo", "V_r1_boot_hi",
+        "theta_1", "theta_1_err", "delta_chi2", "p_value", "rms_2term", "rms_4term"]
+""")
+
+    md(r"""
+### Figure: recovered V_rad(theta) modulation
+
+The curve is `s1 + V_r1*cos(theta - theta_1)` from the 4-term fit; the
+points are the binned per-sector empirical estimate, `(binned dv_prefit -
+c0)/sin(theta)` (dropped within +/-`arcsin(0.15)` of the major axis, where
+`V_rad` has no leverage). If hypothesis (B) holds, the curve should swing
+well away from zero while its mean (`s1`, the dashed line) sits near zero --
+the suppression, shown directly.
+""")
+
+    code(r"""
+hp.fig_m1_modulation(res)
+None
+""")
+
+    md(r"""
+### Figure: inclination scan -- is this an inclination-error artifact?
+
+`chi2(inc, V_r1)`, same style and calibration (`chi2_min/n_eff = 1`) as the
+PA-degeneracy scan, holding the pixel mask fixed at the fiducial geometry.
+If the contours open up toward `V_r1 = 0` within a plausible inclination
+error (here +/-10 deg), the m=2 signal could be an inclination artifact
+(Schoenmakers, Franx & de Zeeuw 1997) rather than a modulated flow; if the
+contours stay closed away from zero across the scanned range, it isn't.
+""")
+
+    code(r"""
+hp.fig_inclination_scan(res)
+None
+""")
+
+    md(r"""
+### Figure: theta_1 compass -- phase coherence across rings, and the void
+
+An inclination error locks `theta_1` to the major or minor axis by
+geometry; an off-centre impact points `theta_1` at the impact azimuth,
+consistent between rings but not necessarily aligned with either axis. This
+also computes the void's mean azimuth in the *same* theta frame as the
+ring fits (relative to `XPOS`/`YPOS`, not the void's own center used for its
+`R_avg`/`Delta theta` in `timescales.py` -- see
+`timescales.void_azimuth_in_disk_frame`'s docstring for why those need to be
+two separate evaluations). If `theta_1` points toward the void's azimuth (or
+its anti-azimuth), that is an independent morphological confirmation of a
+kinematic measurement, from two different datasets -- Wallin & Struck-Marcell
+Sec 3.3.3 attribute their banana-shaped void to the same off-centre impact
+geometry Test 1 is testing for.
+""")
+
+    code(r"""
+import timescales as ts
+from astropy.io import fits
+
+ts_cfg = ts.Config(trm_dir=trm_dir, ringlog_path=cfg.ringlog_path, results_dir=cfg.results_dir)
+rc_mod = ts.load_rotation_curve(ts_cfg.ringlog_path)
+data_1mom_mod = sorted((ts_cfg.trm_dir / "maps").glob("*_1mom.fits"))
+data_1mom_mod = [f for f in data_1mom_mod if "_local_" not in f.name][0]
+header_mod = fits.getheader(data_1mom_mod)
+
+void_azimuth_deg = ts.void_azimuth_in_disk_frame(ts_cfg, rc_mod, header_mod, cdelt1_sign)
+print(f"Void azimuth (disk frame) = {void_azimuth_deg:.2f} deg")
+print(f"theta_1 per ring: {[f'{v:.1f}' for v in sub_mod['theta_1']]} deg "
+      f"(scatter = {np.std(sub_mod['theta_1']):.1f} deg)")
+
+hp.fig_theta1_compass(res, void_azimuth_deg=void_azimuth_deg)
+None
+""")
+
+    md(r"""
+### Figure: residual autocorrelation -- noise, or structure?
+
+The primary residual-structure test, needing no noise model: the
+azimuthally-averaged autocorrelation of the post-fit residual map, compared
+with the pre-fit map and the beam. Pure beam-correlated noise has a
+reproducible correlation length `L_corr/beam ~= 0.75` (not 1:1 -- see
+`harmonic_fit.residual_autocorrelation`'s docstring for the `sqrt(2)` factor
+between a Gaussian beam's FWHM and the HWHM of its own autocorrelation, and
+selftest Test 11 for the empirical calibration used here). `L_corr` well
+above that baseline means spatially coherent structure the harmonic model
+hasn't captured; comparing pre-fit to post-fit tests whether removing `s1`
+already accounts for some of it (Test 2.2 below quantifies the same
+comparison via `chi2`/RMS rather than autocorrelation length).
+""")
+
+    code(r"""
+hp.fig_residual_autocorr(res)
+None
+""")
+
+    md(r"""
+### Test 2.2 / 2.3: does the 4-term model reduce the residual, and against what noise floor?
+
+`rms_2term` vs. `rms_4term` above is the direct per-ring pairing with
+Test 1's `delta_chi2`: if adding `c2`, `s2` materially reduces the RMS, the
+excess scatter was azimuthal structure, not noise. Test 2.3 (comparing the
+residual against an SNR-derived expected centroid error) is weaker --
+it needs a noise model -- and is reported here only if a real cube RMS is
+available; `mom2` (line width) is never substituted for centroid
+uncertainty, which was a bug in the original script.
+""")
+
+    code(r"""
+import json
+
+residual_structure = json.loads((cfg.results_dir / "residual_structure.json").read_text())
+cec = residual_structure["centroid_error_check"]
+if cec["computed"]:
+    for ring, d in cec["per_ring"].items():
+        print(f"{ring}: rms_residual={d['rms_residual_kms']:.2f} km/s, "
+              f"median expected centroid error={d['median_expected_centroid_error_kms']:.2f} km/s, "
+              f"ratio={d['ratio']:.2f}")
+else:
+    print(f"Test 2.3 not computed: {cec['reason']}")
+""")
+
+    md(r"""
 ## The V_rad-PA degeneracy: analytic derivation
 
 A PA error `dPA` contributes a `sin(theta)` term to the residual -- the same
