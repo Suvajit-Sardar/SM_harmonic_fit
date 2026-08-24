@@ -162,9 +162,12 @@ class Config:
 def _q(value, unit: str, type_: str, assumption: str) -> dict:
     """Section 3 (Output): the {value, unit, type, assumption} wrapper every
     quantity in timescales.json (and every row of the Table 2 summary) must
-    use. type_ is one of "estimate" | "upper_limit" | "rejected" |
-    "exclusion"."""
-    assert type_ in ("estimate", "upper_limit", "rejected", "exclusion"), type_
+    use. type_ is one of "estimate" | "upper_limit" | "lower_limit" |
+    "rejected" | "exclusion". "lower_limit" is for a constraint that bounds
+    t from below (e.g. the pair-orbit boundedness limit, Section 2.6) --
+    distinct from "upper_limit", which bounds t from above (e.g. the void
+    interaction timescale, Section 2.3)."""
+    assert type_ in ("estimate", "upper_limit", "lower_limit", "rejected", "exclusion"), type_
     return {"value": value, "unit": unit, "type": type_, "assumption": assumption}
 
 
@@ -1360,10 +1363,18 @@ def run(cfg: Config) -> dict:
         # range was computed, so it's eligible to contribute to it.
         if pair_orbit["theta_v_eq_vesc_deg"] is not None:
             i_cross = int(np.argmin(np.abs(pair_orbit["theta_grid_deg"] - pair_orbit["theta_v_eq_vesc_deg"])))
+            # v/v_esc(theta) increases monotonically with theta (larger theta
+            # -> smaller r_now and larger v_now, both pushing v/v_esc up),
+            # while t(theta) decreases monotonically with theta -- so the
+            # bound region is theta <= theta_v_eq_vesc (smaller theta, LONGER
+            # orbit), and the unbound region is theta > theta_v_eq_vesc
+            # (larger theta, shorter/unphysical-if-bound orbit). Boundedness
+            # therefore excludes every t below the crossing's t, making that
+            # t a LOWER bound, not an upper one.
             quantities["pair_orbit_bound_lower_limit"] = _q(
-                float(pair_orbit["t_grid_myr"][i_cross]), "Myr", "upper_limit",
+                float(pair_orbit["t_grid_myr"][i_cross]), "Myr", "lower_limit",
                 f"v=v_esc at theta={pair_orbit['theta_v_eq_vesc_deg']:.1f} deg -- t is a LOWER bound if the pair is bound "
-                "(smaller theta is unbound, larger theta is a longer, still-bound orbit)")
+                "(smaller theta is bound, a longer orbit; larger theta is unbound)")
     if debris is not None:
         quantities["debris_t"] = _q(debris["t_debris_myr_REJECTED"], "Myr", "rejected",
                                      f"free-expansion gradients differ by a factor of {debris['ratio']:.2f} -- not a clock")
@@ -1424,14 +1435,27 @@ def run(cfg: Config) -> dict:
 def build_summary_table(results: dict) -> list:
     """Table 2 (Method, Observable, t [Myr], Type, Limiting assumption) --
     generated directly from results["quantities"] (the same dict written to
-    timescales.json), never hand-typed."""
+    timescales.json), never hand-typed.
+
+    Two kinds of entries in results["quantities"] are deliberately excluded
+    from this table (though they remain in results["quantities"] and thus in
+    timescales.json -- "keep them available as named variables" -- and the
+    notebook prints them itself, e.g. as a linear-vs-orbit-integration
+    deceleration illustration):
+      - "pair_linear_naive_theta45" / "pair_linear_disk_normal_theta_i": the
+        linear R_sep/dV_sys estimate (Section 2.5) is superseded by the
+        galpy orbit integration (Section 2.6, "pair_orbit_theta_i") as the
+        headline pair-timescale number.
+      - "wsm_eps_R_ring_f_lo" / "wsm_eps_R_ring_f_hi": consolidated below
+        into a single WSM_EPOCH_RANGE_KEYS row spanning both epochs, rather
+        than two separate rows for the same eps=R_ring identification.
+    """
+    EXCLUDED_FROM_TABLE2 = {"pair_linear_naive_theta45", "pair_linear_disk_normal_theta_i"}
+    WSM_EPOCH_RANGE_KEYS = ("wsm_eps_R_ring_f_lo", "wsm_eps_R_ring_f_hi")
+
     label_method = {
         "ring_turnaround": ("Epicyclic (ring)", "T_kappa(R_ring)/2"),
         "void_interaction_upper_limit": ("Crescent void", "T_phi * dtheta/360"),
-        "wsm_eps_R_ring_f_lo": ("WSM epoch (eps=R_ring)", f"f={results['wsm_epoch_conversion']['epochs'][0]}"),
-        "wsm_eps_R_ring_f_hi": ("WSM epoch (eps=R_ring)", f"f={results['wsm_epoch_conversion']['epochs'][-1]}"),
-        "pair_linear_naive_theta45": ("Pair separation (linear)", "theta=45 deg"),
-        "pair_linear_disk_normal_theta_i": ("Pair separation (linear)", "theta=i"),
         "pair_orbit_theta_i": ("Pair orbit (galpy)", "radial infall, theta=i"),
         "pair_orbit_bound_lower_limit": ("Pair orbit (galpy)", "v=v_esc bound"),
         "debris_t": ("Debris expansion", "(dR/dV)*cot(i) [REJECTED]"),
@@ -1439,6 +1463,8 @@ def build_summary_table(results: dict) -> list:
     }
     rows = []
     for key, q in results["quantities"].items():
+        if key in EXCLUDED_FROM_TABLE2 or key in WSM_EPOCH_RANGE_KEYS:
+            continue
         if q["unit"] != "Myr":
             # Non-timescale exclusion diagnostics (e.g. delta_chi2) don't fit
             # a "t [Myr]" column; they are reported by radial_oscillation_
@@ -1450,6 +1476,19 @@ def build_summary_table(results: dict) -> list:
             "Method": method, "Observable": observable, "t [Myr]": q["value"],
             "Type": q["type"], "Limiting assumption": q["assumption"],
         })
+
+    if all(k in results["quantities"] for k in WSM_EPOCH_RANGE_KEYS):
+        q_lo = results["quantities"]["wsm_eps_R_ring_f_lo"]
+        q_hi = results["quantities"]["wsm_eps_R_ring_f_hi"]
+        epochs = results["wsm_epoch_conversion"]["epochs"]
+        t_lo, t_hi = sorted((q_lo["value"], q_hi["value"]))
+        rows.append({
+            "Method": "WSM epoch (eps=R_ring)", "Observable": f"f={epochs[0]}-{epochs[-1]}",
+            "t [Myr]": f"{t_lo:.1f}-{t_hi:.1f}", "Type": "estimate",
+            "Limiting assumption": f"f={epochs[0]}-{epochs[-1]}, eps=R_ring "
+                                    "(Wallin & Struck-Marcell 1994 Sec 4.2)",
+        })
+
     disk_shear = results.get("disk_shear")
     if disk_shear is not None:
         rows.append({
