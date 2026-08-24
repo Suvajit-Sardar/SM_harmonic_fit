@@ -197,7 +197,7 @@ pot, Ms, a_scale, r200 = ts.build_nfw_potential(cfg)
 print(f"\nM_s = {nfw_check['Ms_Msun']:.4e} Msun, a = {nfw_check['a_kpc']:.3f} kpc, r_200 = {nfw_check['r200_kpc']:.3f} kpc")
 """)
 
-    md(r"""
+    md(rf"""
 ## 3. Section 1: `R_ring` from the moment-0 map
 
 ```
@@ -210,6 +210,19 @@ same deprojection the harmonic ring fits use) on the data moment-0 map.
 `R_ring` is the radius of the profile's maximum; its uncertainty is half the
 annulus width (the adopted TRM's own ring width, so the radial binning
 resolution matches the rest of this project).
+
+**The annulus grid always starts at `R=0`**, independent of where
+`{trm_dir_name}`'s own TRM rings happen to start (printed below -- the
+harmonic fit was only run over that range, but the moment-0 map itself
+covers the whole galaxy). If the innermost annuli come back with `n_pix=0`
+(no finite moment-0 pixels), that is a genuine non-detection at the disc
+centre -- expected for a collisional ring galaxy, whose HI is swept out
+into the ring, leaving a real central hole -- not a gap introduced by
+cropping the profile to the TRM's radial coverage. `R_ring`'s peak search
+already runs over the full `R=0`-to-`R_max` grid and skips non-finite
+annuli (`np.where(valid, sigma, -np.inf)`), so a genuine central hole
+cannot shift `R_ring`; the full profile (not windowed around the peak) is
+printed and plotted below so that is visible rather than asserted.
 """)
 
     code(r"""
@@ -220,9 +233,15 @@ sigma_profile = ts.measure_R_ring(rc, mom0_data, header0, cdelt1_sign, ringlog_w
 print(f"R_ring = {sigma_profile.R_ring_kpc:.2f} +/- {sigma_profile.R_ring_err_kpc:.2f} kpc "
       f"({sigma_profile.R_ring_arcsec:.1f} arcsec, annulus {sigma_profile.ring_index}, "
       f"annulus width {sigma_profile.annulus_width_arcsec:.2f} arcsec)")
+print(f"TRM ring coverage starts at {rc.radii_kpc.min():.2f} kpc -- the Sigma_HI profile below starts at R=0 regardless.")
+
+n_blank = int(np.sum(sigma_profile.n_pix == 0))
+if n_blank:
+    print(f"{n_blank} innermost annuli have n_pix=0 (no moment-0 detection) -- a real central hole, not a cropped range.")
+
 print(f"\n{'annulus':>8}{'R [kpc]':>10}{'Sigma_HI':>14}{'+/- err':>12}{'n_pix':>8}")
-for i in range(max(sigma_profile.ring_index - 3, 0), min(sigma_profile.ring_index + 4, len(sigma_profile.R_kpc))):
-    marker = "  <-- R_ring" if i == sigma_profile.ring_index else ""
+for i in range(len(sigma_profile.R_kpc)):
+    marker = "  <-- R_ring" if i == sigma_profile.ring_index else ("  (no detection)" if sigma_profile.n_pix[i] == 0 else "")
     print(f"{i:8d}{sigma_profile.R_kpc[i]:10.3f}{sigma_profile.sigma[i]:14.5f}{sigma_profile.sigma_err[i]:12.5f}{sigma_profile.n_pix[i]:8d}{marker}")
 """)
 
@@ -230,7 +249,10 @@ for i in range(max(sigma_profile.ring_index - 3, 0), min(sigma_profile.ring_inde
 ## Figure 2: `Sigma_HI(R)` profile, `R_ring` marked
 
 (Numbered to match the spec's figure list; displayed here since it belongs
-right after the measurement above.)
+right after the measurement above.) The x-axis is pinned to start at `R=0`
+regardless of where the plotted points begin, and the central non-detection
+(if any) is shaded explicitly, so the true radial hole is distinguishable
+from an axis that merely autoscaled to the first data point.
 """)
 
     code(r"""
@@ -239,12 +261,19 @@ def fig_sigma_hi_profile(sigma_profile):
     valid = np.isfinite(sigma_profile.sigma)
     ax.errorbar(sigma_profile.R_kpc[valid], sigma_profile.sigma[valid], yerr=sigma_profile.sigma_err[valid],
                 fmt="o-", color="teal", ecolor="gray", capsize=3, markersize=5, lw=1.5, label=r"$\Sigma_{\rm HI}$ (deprojected)")
+
+    no_detection = sigma_profile.n_pix == 0
+    if np.any(no_detection) and np.any(valid):
+        R_first_valid = sigma_profile.R_edges_kpc[np.argmax(valid)]
+        ax.axvspan(0, R_first_valid, color="0.85", zorder=0, label="no HI detected (central hole)")
+
     ax.axvline(sigma_profile.R_ring_kpc, color="crimson", linestyle="--", lw=2,
                label=f"$R_{{\\rm ring}}$ = {sigma_profile.R_ring_kpc:.2f} $\\pm$ {sigma_profile.R_ring_err_kpc:.2f} kpc")
     ax.axvspan(sigma_profile.R_ring_kpc - sigma_profile.R_ring_err_kpc,
                sigma_profile.R_ring_kpc + sigma_profile.R_ring_err_kpc, color="crimson", alpha=0.1)
     ax.set_xlabel("Deprojected radius $R$ [kpc]")
     ax.set_ylabel(r"$\Sigma_{\rm HI}$ (inclination-corrected, arbitrary units)")
+    ax.set_xlim(0, sigma_profile.R_edges_kpc[-1])
     ax.grid(True, linestyle="--", alpha=0.5)
     ax.legend(loc="best", frameon=True)
     ax.set_title(f"{TRM_DIR}: azimuthally-averaged HI surface density")
