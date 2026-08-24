@@ -18,7 +18,6 @@ results to ``results/``. See ``harmonic_plots.py`` for figures.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import warnings
 from dataclasses import dataclass
@@ -28,8 +27,6 @@ from typing import Sequence
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
-from scipy.signal import fftconvolve
-from scipy.stats import chi2 as chi2_dist
 
 # --------------------------------------------------------------------------
 # 5.1 Config
@@ -64,17 +61,6 @@ class Config:
     vsys_scan_step_kms: float = 0.5
     s1_grid_halfwidth_kms: float = 80.0
     s1_grid_step_kms: float = 0.5
-
-    # Azimuthal-modulation test (does the axisymmetric sin(theta) fit
-    # suppress a genuinely modulated V_rad?). Independent of model_terms --
-    # this test always fits its own ("c0","s1"), ("c0","s1","c2","s2") and
-    # six-term models, at side="both" and the primary weighting only, per
-    # ring. See vr1_theta1_from_c2s2 / inclination_scan_vr1.
-    inc_scan_halfwidth_deg: float = 10.0
-    inc_scan_step_deg: float = 0.5
-    vr1_grid_halfwidth_kms: float = 100.0
-    vr1_grid_step_kms: float = 2.0
-    theta1_scan_step_deg: float = 15.0  # profiled (nuisance) phase grid inside the inclination scan
 
     n_bootstrap: int = 2000
     random_seed: int = 42
@@ -522,43 +508,6 @@ def pa_degeneracy_slope(theta_rad, w, vrot, inc_deg):
     return vrot * K  # multiply by dPA in radians to get s1_leak
 
 
-def vr1_theta1_from_c2s2(c2: float, s2: float, cov_c2s2=None):
-    """Inverts an azimuthally modulated V_rad(theta) = V_r0 + V_r1*cos(theta
-    - theta_1)'s contribution to the m=2 harmonic terms:
-
-        V_r1 = 2*sqrt(c2^2 + s2^2), theta_1 = arctan2(-c2, s2)
-
-    (derived from term-matching V_rad(theta)*sin(theta) against
-    c2*cos(2theta) + s2*sin(2theta) -- see the module-level "azimuthal
-    modulation" note near process_ring). theta_1 is in radians, (-pi, pi].
-
-    If cov_c2s2 (the 2x2 [[var(c2),cov(c2,s2)],[cov(c2,s2),var(s2)]]
-    sub-covariance from the 4-term fit) is given, propagates it to
-    (V_r1_err, theta_1_err) analytically:
-        dV_r1/dc2 = 4*c2/V_r1, dV_r1/ds2 = 4*s2/V_r1
-    and the analogous Jacobian for theta_1 = atan2(-c2, s2). Returns
-    (V_r1, theta_1, nan, nan) if cov_c2s2 is None (e.g. a single bootstrap
-    draw, where only the point value is wanted) or V_r1 == 0 (Jacobian
-    undefined at the origin).
-    """
-    V_r1 = 2.0 * np.sqrt(c2**2 + s2**2)
-    theta_1 = np.arctan2(-c2, s2)
-    if cov_c2s2 is None or V_r1 == 0:
-        return V_r1, theta_1, float("nan"), float("nan")
-
-    dVr1_dc2 = 4.0 * c2 / V_r1
-    dVr1_ds2 = 4.0 * s2 / V_r1
-    denom = c2**2 + s2**2
-    dth1_dc2 = -s2 / denom
-    dth1_ds2 = c2 / denom
-
-    var_c2, var_s2 = float(cov_c2s2[0, 0]), float(cov_c2s2[1, 1])
-    cov_c2_s2 = float(cov_c2s2[0, 1])
-    var_Vr1 = dVr1_dc2**2 * var_c2 + dVr1_ds2**2 * var_s2 + 2.0 * dVr1_dc2 * dVr1_ds2 * cov_c2_s2
-    var_th1 = dth1_dc2**2 * var_c2 + dth1_ds2**2 * var_s2 + 2.0 * dth1_dc2 * dth1_ds2 * cov_c2_s2
-    return V_r1, theta_1, float(np.sqrt(max(var_Vr1, 0.0))), float(np.sqrt(max(var_th1, 0.0)))
-
-
 # --------------------------------------------------------------------------
 # 5.7 Bootstrap
 # --------------------------------------------------------------------------
@@ -579,8 +528,9 @@ def block_bootstrap_generic(
     """Resample beam-sized cells with replacement, concatenate their pixels,
     refit, and extract an arbitrary scalar from each refit via
     extract_fn(FitResult) -> float. Returns (draws, n_cells). Generalizes
-    block_bootstrap_s1 (s1 extraction) to other derived quantities, e.g.
-    V_r1 from a 4-term (c0,s1,c2,s2) fit -- see vr1_theta1_from_c2s2.
+    the s1-specific bootstrap below so other modules (e.g.
+    azimuthal_modulation.py) can reuse the same resampling scheme for other
+    derived quantities without duplicating it.
 
     A draw can be degenerate (rank-deficient design matrix, e.g. when a
     small-n side/ring resamples the same single-pixel cell for every slot,
@@ -731,160 +681,6 @@ def vsys_scan(cfg, ringlog_row, mapset, fiducial_mask, xc, yc, pa0, inc_deg, vro
             "chi2_best": chi2_best, "chi2_grid": chi2_grid, "vsys0_kms": vsys0}
 
 
-def inclination_scan_vr1(cfg, ringlog_row, mapset, fiducial_mask, xc, yc, pa0, vrot, vsys, cdelt1_sign):
-    """Azimuthal-modulation Section 1.3 discriminant: is the m=2 signal
-    (V_r1) an inclination-error artifact (Schoenmakers, Franx & de Zeeuw
-    1997), rather than a modulated radial flow? Rerun the 4-term
-    (c0,s1,c2,s2) fit on a grid of inclination, holding the pixel mask fixed
-    at the fiducial geometry -- same pattern, and same reasoning, as
-    pa_scan/vsys_scan (CLAUDE.md 5.8: freezing the mask isolates the
-    geometric effect and keeps the degrees of freedom constant across the
-    scan).
-
-    theta_1 (the phase of the m=2 signal) is a nonlinear function of
-    (c2, s2), so unlike the s1 scans this profiles a genuine grid over
-    theta_1 (nuisance) at each (inc, V_r1) grid point rather than a closed
-    form: c0, s1 remain linear nuisance parameters and are profiled exactly
-    (2x2 weighted normal equations, vectorised over the theta_1 grid); V_r1,
-    theta_1 are swept explicitly. 'Grid, don't optimise' throughout, as
-    elsewhere in this module.
-    """
-    inc0 = float(ringlog_row["INC(deg)"])
-    inc_grid = np.arange(-cfg.inc_scan_halfwidth_deg, cfg.inc_scan_halfwidth_deg + 1e-9, cfg.inc_scan_step_deg) + inc0
-    vr1_grid = np.arange(0.0, cfg.vr1_grid_halfwidth_kms + 1e-9, cfg.vr1_grid_step_kms)
-    theta1_grid = np.radians(np.arange(0.0, 360.0, cfg.theta1_scan_step_deg))
-
-    mom1_m = mapset.data_mom1[fiducial_mask]
-    mom2_m = mapset.data_mom2[fiducial_mask]
-
-    n_inc, n_vr1 = len(inc_grid), len(vr1_grid)
-    chi2_grid = np.empty((n_inc, n_vr1))
-    vr1_best = np.empty(n_inc)
-    chi2_best = np.empty(n_inc)
-
-    for i, inc in enumerate(inc_grid):
-        _, theta_full = make_geometry(mapset.shape, xc, yc, pa0, inc, cdelt1_sign)
-        theta_m = theta_full[fiducial_mask]
-        d_m = build_data_vector(mom1_m, vsys, inc, vrot, theta_m)
-        w_m = compute_weights(theta_m, mom2_m, cfg.primary_weighting, cfg.sigma_floor_kms)
-
-        sin_t = np.sin(theta_m)
-        cos2t = np.cos(2.0 * theta_m)
-        sin2t = np.sin(2.0 * theta_m)
-
-        # (c0, s1) nuisance normal-equation matrix depends only on theta_m/w_m
-        # -- fixed for this inc, independent of (V_r1, theta_1).
-        A2 = np.column_stack([np.ones_like(theta_m), sin_t])
-        M2 = A2.T @ (w_m[:, None] * A2)
-        M2inv = np.linalg.inv(M2)
-
-        for j, vr1 in enumerate(vr1_grid):
-            c2s = -vr1 / 2.0 * np.sin(theta1_grid)  # (n_theta1,)
-            s2s = vr1 / 2.0 * np.cos(theta1_grid)
-            r = d_m[None, :] - c2s[:, None] * cos2t[None, :] - s2s[:, None] * sin2t[None, :]  # (n_theta1, n_pix)
-            rhs0 = np.sum(w_m[None, :] * r, axis=1)
-            rhs1 = np.sum(w_m[None, :] * r * sin_t[None, :], axis=1)
-            rhs = np.stack([rhs0, rhs1], axis=1)  # (n_theta1, 2)
-            p = rhs @ M2inv.T  # M2 symmetric, so this solves M2 @ p_row = rhs_row for every row
-            resid = r - p[:, 0:1] - p[:, 1:2] * sin_t[None, :]
-            chi2_t1 = np.sum((resid / mom2_m[None, :]) ** 2, axis=1)  # (n_theta1,)
-            chi2_grid[i, j] = np.min(chi2_t1)
-
-        jmin = np.argmin(chi2_grid[i, :])
-        vr1_best[i] = vr1_grid[jmin]
-        chi2_best[i] = chi2_grid[i, jmin]
-
-    return {"inc_grid_deg": inc_grid, "vr1_grid_kms": vr1_grid, "vr1_best": vr1_best,
-            "chi2_best": chi2_best, "chi2_grid": chi2_grid, "inc0_deg": inc0}
-
-
-def residual_autocorrelation(resid: np.ndarray, mask: np.ndarray, pixscale_arcsec: float) -> dict:
-    """Test 2.1: masked 2D autocorrelation of a residual map via FFT,
-    azimuthally averaged to give L_corr (half-width at half maximum,
-    arcsec). This needs no noise model, which is why it is the primary
-    residual-structure test: pure (beam-correlated) noise gives L_corr
-    approximately equal to the beam size; L_corr significantly greater than
-    the beam means the residual retains spatially coherent structure the
-    harmonic model has not captured.
-
-    The mask is handled explicitly in the FFT cross-correlation (not just
-    zero-filled) so blanked pixels don't bias the estimate: ACF(lag) =
-    sum_x resid[x]*resid[x+lag] / sum_x mask[x]*mask[x+lag], both sums via
-    fftconvolve.
-    """
-    m = mask & np.isfinite(resid)
-    if not np.any(m):
-        raise RuntimeError("residual_autocorrelation: empty mask")
-    resid_zeroed = np.where(m, resid - np.mean(resid[m]), 0.0)
-    mask_f = m.astype(float)
-
-    acf_num = fftconvolve(resid_zeroed, resid_zeroed[::-1, ::-1], mode="full")
-    acf_norm = fftconvolve(mask_f, mask_f[::-1, ::-1], mode="full")
-    with np.errstate(invalid="ignore", divide="ignore"):
-        acf = np.where(acf_norm > 0, acf_num / acf_norm, np.nan)
-
-    ny, nx = acf.shape
-    cy, cx = (ny - 1) // 2, (nx - 1) // 2  # zero-lag pixel of a 'full'-mode fftconvolve output
-    y_idx, x_idx = np.indices(acf.shape)
-    lag_pix = np.hypot(y_idx - cy, x_idx - cx)
-    acf0 = float(acf[cy, cx])
-
-    max_lag = min(resid.shape) // 2
-    bin_edges = np.arange(0, max_lag + 2)
-    lag_flat, acf_flat = lag_pix.ravel(), acf.ravel()
-    valid = np.isfinite(acf_flat) & (lag_flat <= max_lag)
-    bin_idx = np.digitize(lag_flat[valid], bin_edges) - 1
-    n_bins = len(bin_edges) - 1
-    radial_acf = np.full(n_bins, np.nan)
-    for b in range(n_bins):
-        sel = bin_idx == b
-        if np.any(sel):
-            radial_acf[b] = np.mean(acf_flat[valid][sel])
-    lag_centers_pix = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-
-    half = acf0 / 2.0
-    below = np.nonzero(np.isfinite(radial_acf) & (radial_acf < half))[0]
-    if below.size == 0:
-        L_corr_pix = float("nan")
-    else:
-        k = below[0]
-        if k == 0:
-            L_corr_pix = float(lag_centers_pix[0])
-        else:
-            x0, x1 = lag_centers_pix[k - 1], lag_centers_pix[k]
-            y0, y1 = radial_acf[k - 1], radial_acf[k]
-            L_corr_pix = float(x0 + (half - y0) * (x1 - x0) / (y1 - y0)) if y1 != y0 else float(x1)
-
-    return {
-        "L_corr_arcsec": L_corr_pix * pixscale_arcsec if np.isfinite(L_corr_pix) else float("nan"),
-        "lag_arcsec": (lag_centers_pix * pixscale_arcsec).tolist(),
-        "radial_acf": radial_acf.tolist(),
-        "acf0": acf0,
-    }
-
-
-def find_cube_rms(trm_dir: Path, header) -> "float | None":
-    """Test 2.3 needs a cube RMS to convert mom0 into a per-pixel SNR map.
-    Looks for an RMS/NOISE-like FITS header keyword on the data moment
-    maps, or a companion stats/noise/rms .txt file in the TRM model
-    directory. Returns None -- never a guessed number -- if neither exists;
-    callers must then report Test 2.3 as not computed rather than
-    substituting mom2 (the line width, not the centroid uncertainty) in its
-    place, which was a bug in the original script."""
-    for k in header.keys():
-        if k and any(tag in k.upper() for tag in ("RMS", "NOISE")):
-            try:
-                return float(header[k])
-            except (TypeError, ValueError):
-                continue
-    for pattern in ("*rms*.txt", "*noise*.txt", "*stats*.txt"):
-        if list(Path(trm_dir).glob(pattern)):
-            # A candidate file exists but its format is not a documented
-            # convention of this project -- don't guess how to parse it.
-            return None
-    return None
-
-
 # --------------------------------------------------------------------------
 # 5.9 main()
 # --------------------------------------------------------------------------
@@ -921,82 +717,9 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng, ppb):
         "approaching": base_mask & ~(cos_t_full > 0),
     }
 
-    # ------------------------------------------------------------------
-    # Azimuthal-modulation test (does the axisymmetric sin(theta) fit
-    # suppress a genuinely azimuthally-modulated V_rad?). Independent of
-    # cfg.model_terms -- always its own (c0,s1) / (c0,s1,c2,s2) /
-    # (c0,s1,c2,s2,c3,s3) fits, side="both", primary weighting only, one
-    # instance per ring. See vr1_theta1_from_c2s2's docstring for the
-    # term-matching derivation of V_r1, theta_1 from c2, s2.
-    # ------------------------------------------------------------------
-    mask_h = side_masks["both"]
-    theta_h = theta_full[mask_h]
-    mom1_h = mapset.data_mom1[mask_h]
-    mom2_h = mapset.data_mom2[mask_h]
-    cell_id_h = cell_id_full[mask_h]
-    d_h = build_data_vector(mom1_h, vsys, inc, vrot, theta_h)
-    w_h = compute_weights(theta_h, mom2_h, cfg.primary_weighting, cfg.sigma_floor_kms)
-
-    fit_2 = fit_wls(d_h, theta_h, w_h, mom2_h, ("c0", "s1"))
-    fit_4 = fit_wls(d_h, theta_h, w_h, mom2_h, ("c0", "s1", "c2", "s2"))
-    fit_6 = fit_wls(d_h, theta_h, w_h, mom2_h, ("c0", "s1", "c2", "s2", "c3", "s3"))
-
-    chi2_2_raw = float(np.sum((fit_2.resid / mom2_h) ** 2))
-    chi2_4_raw = float(np.sum((fit_4.resid / mom2_h) ** 2))
-    chi2_6_raw = float(np.sum((fit_6.resid / mom2_h) ** 2))
-
-    n_eff_h = n_effective(int(np.sum(mask_h)), ppb)
-    # Same "rescale so chi2/n_eff = 1" calibration as the PA/VSYS scans
-    # (CLAUDE.md 5.8) -- pixels are correlated within the beam, so a raw
-    # pixel-count chi2 is not directly a chi2(df) draw; anchored to this
-    # test's own 2-term (null) model, since cfg.model_terms need not equal
-    # (c0,s1) (e.g. the no_c0 pipeline pass).
-    scale_h = n_eff_h / max(chi2_2_raw, 1e-30)
-    chi2_2term = chi2_2_raw * scale_h
-    chi2_4term = chi2_4_raw * scale_h
-    chi2_6term = chi2_6_raw * scale_h
-    delta_chi2 = chi2_2term - chi2_4term
-    p_value = float(chi2_dist.sf(max(delta_chi2, 0.0), df=2))
-    delta_chi2_3rd = chi2_4term - chi2_6term
-    p_value_3rd = float(chi2_dist.sf(max(delta_chi2_3rd, 0.0), df=2))
-
-    c2v, s2v = fit_4.value("c2"), fit_4.value("s2")
-    ic2, is2 = fit_4.terms.index("c2"), fit_4.terms.index("s2")
-    cov_c2s2 = fit_4.cov[np.ix_([ic2, is2], [ic2, is2])]
-    V_r1, theta_1_rad, V_r1_err_formal, theta_1_err_formal_rad = vr1_theta1_from_c2s2(c2v, s2v, cov_c2s2)
-
-    def _extract_vr1(fit):
-        return vr1_theta1_from_c2s2(fit.value("c2"), fit.value("s2"))[0]
-
-    boot_vr1, n_cells_h = block_bootstrap_generic(
-        d_h, theta_h, mom2_h, cell_id_h, cfg.primary_weighting, cfg.sigma_floor_kms,
-        ("c0", "s1", "c2", "s2"), cfg.n_bootstrap, rng, extract_fn=_extract_vr1,
-    )
-    vr1_lo, vr1_med, vr1_hi = np.percentile(boot_vr1, [16, 50, 84])
-
-    inc_result = inclination_scan_vr1(cfg, ringlog_row, mapset, mask_h, xc, yc, pa0, vrot, vsys, cdelt1_sign)
-    inc_result["chi2_grid"] = inc_result["chi2_grid"] * scale_h
-    inc_result["chi2_best"] = inc_result["chi2_best"] * scale_h
-    inc_result["chi2_rescale_note"] = "rescaled so chi2_min/n_eff = 1, anchored to this test's own 2-term chi2 (see scale_h)"
-
-    order_test_ecsv_fields = dict(
-        c2=c2v, s2=s2v, c2_err=fit_4.err("c2"), s2_err=fit_4.err("s2"),
-        V_r1=V_r1, V_r1_boot_lo=float(vr1_lo), V_r1_boot_med=float(vr1_med), V_r1_boot_hi=float(vr1_hi),
-        theta_1=float(np.degrees(theta_1_rad) % 360.0),
-        theta_1_err=float(np.degrees(theta_1_err_formal_rad)) if np.isfinite(theta_1_err_formal_rad) else float("nan"),
-        chi2_2term=chi2_2term, chi2_4term=chi2_4term, delta_chi2=delta_chi2, p_value=p_value,
-        rms_2term=rms_about_zero(fit_2.resid), rms_4term=rms_about_zero(fit_4.resid),
-    )
-    order_test_extra = dict(
-        ring_index=ring_idx,
-        c3=fit_6.value("c3"), s3=fit_6.value("s3"), c3_err=fit_6.err("c3"), s3_err=fit_6.err("s3"),
-        chi2_6term=chi2_6term, delta_chi2_third_order=delta_chi2_3rd, p_value_third_order=p_value_3rd,
-        n_cells=n_cells_h, n_eff=n_eff_h,
-    )
-
     rows = []
     maps_extra = {"R_arcsec": R_arcsec, "theta": theta_full, "ring_mask_both": base_mask}
-    boot_extra = {f"boot_Vr1_both_{cfg.primary_weighting}": boot_vr1}
+    boot_extra = {}
 
     for side in SIDES:
         mask = side_masks[side]
@@ -1059,17 +782,7 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng, ppb):
                 rms_residual=rms,
                 near_side_assumed="UNRESOLVED",
                 n_removed_quality_mask=n_removed_by_quality_mask,
-                # Azimuthal-modulation test (see block above the side loop):
-                # one instance per ring, attached to side="both" + primary
-                # weighting only -- NaN elsewhere, same pattern as c0/c2/s2.
-                c2_err=np.nan, s2_err=np.nan, V_r1=np.nan,
-                V_r1_boot_lo=np.nan, V_r1_boot_med=np.nan, V_r1_boot_hi=np.nan,
-                theta_1=np.nan, theta_1_err=np.nan,
-                chi2_2term=np.nan, chi2_4term=np.nan, delta_chi2=np.nan, p_value=np.nan,
-                rms_2term=np.nan, rms_4term=np.nan,
             )
-            if side == "both" and scheme == cfg.primary_weighting:
-                row.update(order_test_ecsv_fields)
             rows.append(row)
 
             if side == "both" and scheme == cfg.primary_weighting:
@@ -1094,7 +807,7 @@ def process_ring(cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng, ppb):
     pa_result["chi2_rescale_note"] = "rescaled so chi2_min/n_eff = 1: a calibration to n_eff, not a noise-model claim"
     vsys_result["chi2_rescale_note"] = pa_result["chi2_rescale_note"]
 
-    return rows, maps_extra, pa_result, vsys_result, boot_extra, inc_result, order_test_extra
+    return rows, maps_extra, pa_result, vsys_result, boot_extra
 
 
 def main(cfg: Config):
@@ -1139,13 +852,11 @@ def main(cfg: Config):
         "pixscale_arcsec": np.array(mapset.pixscale_arcsec),
     }
     all_scans = {}
-    order_test_rows = []
     for ring_idx, ringlog_row in enumerate(ringlog):
-        rows, maps_extra, pa_result, vsys_result, boot_extra, inc_result, order_test_extra = process_ring(
+        rows, maps_extra, pa_result, vsys_result, boot_extra = process_ring(
             cfg, ring_idx, ringlog_row, mapset, cdelt1_sign, rng, ppb
         )
         all_rows.extend(rows)
-        order_test_rows.append(order_test_extra)
         for k, v in maps_extra.items():
             all_maps[f"ring{ring_idx}_{k}"] = v
         for k, v in pa_result.items():
@@ -1154,9 +865,6 @@ def main(cfg: Config):
         for k, v in vsys_result.items():
             if k != "chi2_rescale_note":
                 all_scans[f"ring{ring_idx}_vsys_{k}"] = v
-        for k, v in inc_result.items():
-            if k != "chi2_rescale_note":
-                all_scans[f"ring{ring_idx}_inc_{k}"] = v
         for k, v in boot_extra.items():
             all_scans[f"ring{ring_idx}_{k}"] = v
 
@@ -1180,88 +888,6 @@ def main(cfg: Config):
 
     np.savez(cfg.results_dir / "scans.npz", **all_scans)
     print(f"[harmonic_fit] Wrote {cfg.results_dir / 'scans.npz'}")
-
-    # ------------------------------------------------------------------
-    # Test 2: residual structure -- is the excess scatter noise, or the
-    # azimuthally-modulated flow of Test 1 showing up spatially?
-    # ------------------------------------------------------------------
-    n_rings = len(ringlog)
-
-    def _merge_nan_fill(key):
-        out = np.full(mapset.shape, np.nan)
-        for i in range(n_rings):
-            arr = all_maps[f"ring{i}_{key}"]
-            m = np.isfinite(arr)
-            out[m] = arr[m]
-        return out
-
-    dv_prefit_all = _merge_nan_fill("dv_prefit")
-    dv_postfit_all = _merge_nan_fill("dv_postfit")
-    mask_all = np.zeros(mapset.shape, dtype=bool)
-    for i in range(n_rings):
-        mask_all |= all_maps[f"ring{i}_ring_mask_both"]
-
-    acf_pre = residual_autocorrelation(dv_prefit_all, mask_all, mapset.pixscale_arcsec)
-    acf_post = residual_autocorrelation(dv_postfit_all, mask_all, mapset.pixscale_arcsec)
-    beam_fwhm_arcsec = float(np.sqrt(mapset.bmaj_deg * mapset.bmin_deg) * 3600.0)
-    print(f"\n[harmonic_fit] Test 2.1 residual autocorrelation: beam FWHM = {beam_fwhm_arcsec:.2f}\"")
-    print(f"    pre-fit  L_corr = {acf_pre['L_corr_arcsec']:.2f}\"  (ratio to beam = {acf_pre['L_corr_arcsec']/beam_fwhm_arcsec:.2f})")
-    print(f"    post-fit L_corr = {acf_post['L_corr_arcsec']:.2f}\"  (ratio to beam = {acf_post['L_corr_arcsec']/beam_fwhm_arcsec:.2f})")
-
-    # Test 2.3: expected centroid error, only if a real cube RMS is
-    # available -- mom2 (line width) is never substituted for it.
-    data_1mom_files = [f for f in sorted(cfg.maps_dir.glob("*_1mom.fits")) if "_local_" not in f.name]
-    header = fits.getheader(data_1mom_files[0]) if data_1mom_files else {}
-    cube_rms = find_cube_rms(cfg.project_dir, header)
-    if cube_rms is None:
-        print("\n[harmonic_fit] Test 2.3 (expected centroid error) SKIPPED: no cube RMS found in the data "
-              "moment-map FITS headers or a companion stats/noise/rms file in the TRM model directory. "
-              "mom2 (line width) is not a substitute for centroid uncertainty -- see CLAUDE.md-style Test 2.3.")
-        centroid_error_result = {"computed": False, "reason": "no cube RMS available in this TRM model directory"}
-    else:
-        data_0mom_files = [f for f in sorted(cfg.maps_dir.glob("*_0mom.fits")) if "_local_" not in f.name]
-        mom0 = np.squeeze(fits.getdata(data_0mom_files[0])).astype(float)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            snr_map = mom0 / cube_rms
-            expected_centroid_err = np.where(snr_map > 0, mapset.data_mom2 / snr_map, np.nan)
-        ratios = {}
-        for i in range(n_rings):
-            m = all_maps[f"ring{i}_ring_mask_both"]
-            med_expected = float(np.nanmedian(expected_centroid_err[m]))
-            row_i = next(r for r in all_rows if r["ring_index"] == i and r["side"] == "both" and r["weighting"] == cfg.primary_weighting)
-            ratios[f"ring{i}"] = {
-                "rms_residual_kms": row_i["rms_residual"],
-                "median_expected_centroid_error_kms": med_expected,
-                "ratio": row_i["rms_residual"] / med_expected if med_expected > 0 else float("nan"),
-            }
-        centroid_error_result = {"computed": True, "cube_rms": cube_rms, "per_ring": ratios}
-
-    residual_structure = {
-        "beam_bmaj_arcsec": mapset.bmaj_deg * 3600.0,
-        "beam_bmin_arcsec": mapset.bmin_deg * 3600.0,
-        "beam_fwhm_geomean_arcsec": beam_fwhm_arcsec,
-        "autocorrelation": {
-            "prefit": {k: v for k, v in acf_pre.items()},
-            "postfit": {k: v for k, v in acf_post.items()},
-            "prefit_L_corr_over_beam": acf_pre["L_corr_arcsec"] / beam_fwhm_arcsec,
-            "postfit_L_corr_over_beam": acf_post["L_corr_arcsec"] / beam_fwhm_arcsec,
-        },
-        "centroid_error_check": centroid_error_result,
-        "third_order_check": {
-            f"ring{r['ring_index']}": {k: v for k, v in r.items() if k != "ring_index"} for r in order_test_rows
-        },
-    }
-    residual_structure_path = cfg.results_dir / "residual_structure.json"
-    with open(residual_structure_path, "w") as f:
-        json.dump(residual_structure, f, indent=2)
-    print(f"[harmonic_fit] Wrote {residual_structure_path}")
-
-    print("\n[harmonic_fit] Test 1 summary (azimuthal modulation, side=both, primary weighting):")
-    print(f"{'ring':<6}{'V_r1':>10}{'boot_lo':>10}{'boot_hi':>10}{'theta_1':>10}{'delta_chi2':>12}{'p_value':>10}")
-    for row in all_rows:
-        if row["side"] == "both" and row["weighting"] == cfg.primary_weighting:
-            print(f"{row['ring_index']:<6}{row['V_r1']:10.2f}{row['V_r1_boot_lo']:10.2f}{row['V_r1_boot_hi']:10.2f}"
-                  f"{row['theta_1']:10.1f}{row['delta_chi2']:12.2f}{row['p_value']:10.4f}")
 
     print("\n[harmonic_fit] Summary (side=both, primary weighting):")
     print(f"{'ring':<6}{'r_in':>8}{'r_out':>8}{'s1':>10}{'boot_lo':>10}{'boot_hi':>10}{'c0':>10}{'chi2':>10}{'n_eff':>8}")
@@ -1449,112 +1075,6 @@ def selftest():
           "(header formula) and == 20.69 +/- 0.01 for the shipped map",
           np.isclose(ppb7, ppb7_manual, atol=1e-9) and np.isclose(ppb7, 20.69, atol=0.01),
           f"(pixels_per_beam={ppb7:.4f})")
-
-    # ==========================================================================
-    # Azimuthal-modulation tests (does the axisymmetric sin(theta) fit
-    # suppress a genuinely modulated V_rad? -- see the "azimuthal modulation"
-    # block in process_ring and vr1_theta1_from_c2s2)
-    # ==========================================================================
-
-    def _build_synthetic_mom1_modulated(shape, xc, yc, pa_deg, inc_deg, vsys, vrot_of_R,
-                                         vr0_kms, vr1_kms, theta1_deg, cdelt1_sign=-1):
-        """Like _build_synthetic_mom1, but V_rad varies with azimuth:
-        V_rad(theta) = vr0 + vr1*cos(theta - theta1)."""
-        R_pix, theta = make_geometry(shape, xc, yc, pa_deg, inc_deg, cdelt1_sign)
-        vrot = vrot_of_R(R_pix)
-        v_rad = vr0_kms + vr1_kms * np.cos(theta - np.radians(theta1_deg))
-        v_los = vsys + np.sin(np.radians(inc_deg)) * (vrot * np.cos(theta) + v_rad * np.sin(theta))
-        return v_los, R_pix, theta
-
-    # ---------------- Test 8: synthetic m=1 modulation recovery ----------------
-    # THE single most important test in this section: it verifies the whole
-    # premise -- that an azimuthally modulated flow is invisible to the
-    # current (c0,s1) model but recoverable from c2, s2.
-    v_los8, R_pix8, theta8 = _build_synthetic_mom1_modulated(
-        shape, xc, yc, pa0, inc0, vsys0, vrot_of_R_flat, vr0_kms=0.0, vr1_kms=40.0, theta1_deg=60.0,
-    )
-    R_arcsec8 = R_pix8 * 4.0
-    row8 = ringlog[0]
-    mask8 = ring_mask(R_arcsec8, float(row8["r_in_arcsec"]), float(row8["r_out_arcsec"]), v_los8, mom2)
-    theta_m8 = theta8[mask8]
-    d_m8 = build_data_vector(v_los8[mask8], vsys0, inc0, 300.0, theta_m8)
-    w_m8 = compute_weights(theta_m8, mom2[mask8], "sin2", 5.0)
-
-    fit8_2 = fit_wls(d_m8, theta_m8, w_m8, mom2[mask8], ("c0", "s1"))
-    fit8_4 = fit_wls(d_m8, theta_m8, w_m8, mom2[mask8], ("c0", "s1", "c2", "s2"))
-    c2_8, s2_8 = fit8_4.value("c2"), fit8_4.value("s2")
-    Vr1_8, th1_8, _, _ = vr1_theta1_from_c2s2(c2_8, s2_8)
-    th1_8_deg = np.degrees(th1_8) % 360.0
-    th1_diff = min(abs(th1_8_deg - 60.0), 360.0 - abs(th1_8_deg - 60.0))
-
-    ok8_s1null = abs(fit8_2.value("s1")) < 3.0
-    ok8_vr1 = abs(Vr1_8 - 40.0) < 2.0
-    ok8_th1 = th1_diff < 3.0
-    check("8. Synthetic m=1 modulation recovery: 2-term s1~0, 4-term V_r1=40+/-2 km/s, theta_1=60+/-3 deg",
-          ok8_s1null and ok8_vr1 and ok8_th1,
-          f"(s1={fit8_2.value('s1'):.3f}, V_r1={Vr1_8:.3f}, theta_1={th1_8_deg:.2f})")
-
-    # ---------------- Test 9: consistency identity c0 ~= -c2 ----------------
-    c0_8 = fit8_4.value("c0")
-    check("9. Consistency identity: c0 ~= -c2 in the modulated-flow mock (Test 8)",
-          np.isclose(c0_8, -c2_8, atol=1.0),
-          f"(c0={c0_8:.3f}, -c2={-c2_8:.3f})")
-
-    # ---------------- Test 10: null case -- axisymmetric V_rad does not leak into V_r1 ----------------
-    v_los10, R_pix10, theta10 = _build_synthetic_mom1(shape, xc, yc, pa0, inc0, vsys0, vrot_of_R_flat, 25.0)
-    R_arcsec10 = R_pix10 * 4.0
-    mask10 = ring_mask(R_arcsec10, float(row8["r_in_arcsec"]), float(row8["r_out_arcsec"]), v_los10, mom2)
-    theta_m10 = theta10[mask10]
-    d_m10 = build_data_vector(v_los10[mask10], vsys0, inc0, 300.0, theta_m10)
-    w_m10 = compute_weights(theta_m10, mom2[mask10], "sin2", 5.0)
-    fit10_4 = fit_wls(d_m10, theta_m10, w_m10, mom2[mask10], ("c0", "s1", "c2", "s2"))
-    Vr1_10, _, _, _ = vr1_theta1_from_c2s2(fit10_4.value("c2"), fit10_4.value("s2"))
-    check("10. Null case: axisymmetric V_rad=25 km/s gives V_r1 ~ 0 (m=2 terms don't pick up the m=0 part)",
-          Vr1_10 < 2.0, f"(V_r1={Vr1_10:.3f})")
-
-    # ---------------- Test 11: pure-noise L_corr matches the beam scale ----------------
-    # Not literally "L_corr == beam FWHM": for a Gaussian beam kernel g,
-    # ACF(pure noise convolved with g) = g (*) g is itself Gaussian with
-    # std sigma_ACF = sigma_beam*sqrt(2), so its HWHM (L_corr) is
-    # sqrt(2)*HWHM_beam = (sqrt(2)/2)*FWHM_beam =~ 0.707*FWHM_beam -- verified
-    # empirically below (mean ~0.75 over many noise realisations on this
-    # dataset's real beam/pixel scale, tight std ~0.01), not a literal 1:1
-    # match. The acceptance criterion is that L_corr sits at this
-    # well-defined, reproducible pure-noise scale -- not some arbitrarily
-    # larger value -- so a real detection of coherent structure (Test 2.1 on
-    # the actual residual maps) is distinguishable from noise.
-    from scipy.ndimage import gaussian_filter as _gaussian_filter
-
-    real_mapset11 = load_maps(Path(__file__).parent / "TRM_paper" / "maps")
-    beam_fwhm11 = float(np.sqrt(real_mapset11.bmaj_deg * real_mapset11.bmin_deg) * 3600.0)
-    sigma_pix11 = (beam_fwhm11 / real_mapset11.pixscale_arcsec) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-    rng11 = np.random.default_rng(11)
-    ratios11 = []
-    for _trial in range(10):
-        noise11 = rng11.normal(0.0, 1.0, size=(200, 200))
-        conv11 = _gaussian_filter(noise11, sigma=sigma_pix11)
-        acf11 = residual_autocorrelation(conv11, np.ones_like(conv11, dtype=bool), real_mapset11.pixscale_arcsec)
-        ratios11.append(acf11["L_corr_arcsec"] / beam_fwhm11)
-    mean_ratio11 = float(np.mean(ratios11))
-    check("11. Noise case: pure Gaussian-beam-convolved noise gives a reproducible "
-          "L_corr/beam ratio (0.75 +/- 0.05, see comment -- not a literal 1:1 beam match)",
-          abs(mean_ratio11 - 0.75) < 0.05, f"(mean ratio over 10 realisations = {mean_ratio11:.3f})")
-
-    # ---------------- Test 12: regression -- 2-term s1 unaffected by the new code path ----------------
-    # process_ring now also runs the azimuthal-modulation test block (its
-    # own (c0,s1)/(c0,s1,c2,s2)/six-term fits plus a V_r1 bootstrap) BEFORE
-    # the existing per-(side,scheme) loop, which changes the RNG *draw
-    # order* fed to the existing s1 bootstrap -- so s1_boot_lo/hi can shift
-    # slightly run-to-run relative to before this change. fit_wls's s1
-    # *point estimate* is a deterministic function of (d, theta, w, sigma)
-    # only, with no RNG dependence, so it cannot be affected by that
-    # reordering -- confirmed here by two independent fit_wls calls on
-    # identical inputs, and empirically by Tests 1-7 above still passing
-    # with the exact same tolerances as before this section existed.
-    fit12_direct = fit_wls(d_m8, theta_m8, w_m8, mom2[mask8], ("c0", "s1"))
-    check("12. Regression: s1 point estimate has no RNG dependence (deterministic given d/theta/w/sigma)",
-          np.isclose(fit12_direct.value("s1"), fit8_2.value("s1"), atol=1e-12),
-          f"(direct={fit12_direct.value('s1'):.10f}, modulation-test={fit8_2.value('s1'):.10f})")
 
     print(f"\n[selftest] {n_pass} passed, {n_fail} failed")
     return n_fail == 0
