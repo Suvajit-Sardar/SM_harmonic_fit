@@ -27,6 +27,28 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 import harmonic_fit as hf  # noqa: E402
 
+# Pair (companion) measurements, once actually determined for a TRM model,
+# are recorded here rather than only hand-typed into that model's generated
+# config cell -- a from-scratch `python scripts/build_timescales_notebook.py`
+# rebuild must not silently drop them back to the "not yet measured"
+# placeholder. Add an entry when a model's separation/VSYS/bridge-PA/debris
+# measurements are pinned down; leave a model absent from this dict while
+# they are still unmeasured, which renders the commented-out placeholder.
+PAIR_CONFIG_BY_MODEL = {
+    "fixed_PA42": {
+        "vsys_table_kms": {
+            "target": (4679, "Barolo VSYS, this TRM ringlog"),
+            "intruder": (4873.14, "W20 vsys, mid"),
+        },
+        "vsys_pair_label_a": "target",
+        "vsys_pair_label_b": "intruder",
+        "R_sep_kpc": 54,
+        "bridge_pa_deg": 135,
+        "debris_dR_kpc": 19.0,
+        "debris_dV_kms": 300.0,
+    },
+}
+
 
 def eligible_models(root_dir: Path) -> dict:
     """TRM models discovered by harmonic_fit.discover_trm_models that also
@@ -84,7 +106,10 @@ implemented and will report real numbers as soon as `cfg.R_sep_kpc` /
 supplied; until then they skip cleanly (printed, not guessed).
 """)
 
-    md(r"""
+    pair_cfg = PAIR_CONFIG_BY_MODEL.get(trm_dir_name)
+
+    if pair_cfg is None:
+        md(r"""
 ## Config
 
 The one cell in this notebook you are expected to edit -- normally just
@@ -102,6 +127,50 @@ and moment maps cover only this galaxy). Sections 2.5-2.7 skip cleanly
 once those measurements exist, and every cell below picks them up
 automatically -- no other code changes needed.
 """)
+        pair_block = '''
+    # -- Section 2.5/2.6/2.7: uncomment and fill in once these measurements exist --
+    # vsys_table_kms={
+    #     "this_galaxy_barolo": (4677.0, "Barolo VSYS, this TRM ringlog"),
+    #     "companion_<source>": (0.0, "<catalog/measurement, with reference>"),
+    # },
+    # vsys_pair_label_a="this_galaxy_barolo",
+    # vsys_pair_label_b="companion_<source>",
+    # R_sep_kpc=0.0,               # projected separation to the companion
+    # bridge_pa_deg=0.0,           # measured bridge position angle on the sky
+    # debris_dR_kpc=0.0,           # debris expansion: sky-plane extent
+    # debris_dV_kms=0.0,           # debris expansion: LOS velocity difference'''
+    else:
+        md(rf"""
+## Config
+
+The one cell in this notebook you are expected to edit -- normally just
+`TRM_DIR`. The NFW halo (`M200_Msun`, `halo_concentration`, ...), the
+epicyclic "kick" grid ranges, and the void's external RA/Dec corner
+coordinates are `timescales.Config`'s science constants -- see
+`timescales.py` for what each one means and where it comes from.
+
+The pair (companion) fields -- `R_sep_kpc`, `vsys_table_kms`,
+`bridge_pa_deg`, `debris_dR_kpc`/`debris_dV_kms` -- are filled in below from
+`scripts/build_timescales_notebook.PAIR_CONFIG_BY_MODEL["{trm_dir_name}"]`,
+the single source of truth for `{trm_dir_name}`'s companion measurements, so
+a from-scratch rebuild of this notebook does not silently drop them back to
+placeholders. Edit that dict, not this cell, to change them permanently.
+""")
+        vsys_lines = "\n".join(
+            f'        "{label}": ({value!r}, "{desc}"),'
+            for label, (value, desc) in pair_cfg["vsys_table_kms"].items()
+        )
+        pair_block = f'''
+    # -- Section 2.5/2.6/2.7: from PAIR_CONFIG_BY_MODEL["{trm_dir_name}"] --
+    vsys_table_kms={{
+{vsys_lines}
+    }},
+    vsys_pair_label_a="{pair_cfg["vsys_pair_label_a"]}",
+    vsys_pair_label_b="{pair_cfg["vsys_pair_label_b"]}",
+    R_sep_kpc={pair_cfg["R_sep_kpc"]!r},               # projected separation to the companion
+    bridge_pa_deg={pair_cfg["bridge_pa_deg"]!r},           # measured bridge position angle on the sky
+    debris_dR_kpc={pair_cfg["debris_dR_kpc"]!r},           # debris expansion: sky-plane extent
+    debris_dV_kms={pair_cfg["debris_dV_kms"]!r},           # debris expansion: LOS velocity difference'''
 
     code(rf"""
 %matplotlib inline
@@ -120,18 +189,7 @@ cfg = ts.Config(
     trm_dir=trm_dir,
     ringlog_path=hf.find_ringlog(trm_dir),
     results_dir=trm_dir / "results",
-
-    # -- Section 2.5/2.6/2.7: uncomment and fill in once these measurements exist --
-    # vsys_table_kms={{
-    #     "this_galaxy_barolo": (4677.0, "Barolo VSYS, this TRM ringlog"),
-    #     "companion_<source>": (0.0, "<catalog/measurement, with reference>"),
-    # }},
-    # vsys_pair_label_a="this_galaxy_barolo",
-    # vsys_pair_label_b="companion_<source>",
-    # R_sep_kpc=0.0,               # projected separation to the companion
-    # bridge_pa_deg=0.0,           # measured bridge position angle on the sky
-    # debris_dR_kpc=0.0,           # debris expansion: sky-plane extent
-    # debris_dV_kms=0.0,           # debris expansion: LOS velocity difference
+{pair_block}
 )
 cfg
 """)
