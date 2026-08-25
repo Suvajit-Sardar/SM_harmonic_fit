@@ -1,0 +1,2 @@
+# MEAN       MEDIAN       STDDEV       MADFM        MADasSTDDEV  MAX          MIN          
+3.4357e-05   1.5302e-05   2.3807e-04   1.2955e-04   1.9207e-04   2.6673e-03   -8.6996e-04  

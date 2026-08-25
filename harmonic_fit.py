@@ -49,7 +49,7 @@ from astropy.table import Table
 # of the same galaxy. z = VSYS/c is the low-z (optical) convention, matching
 # how Barolo's own VSYS is quoted; at z ~ 0.0156 the relativistic correction
 # is far below the precision this scale is used at.
-VSYS_FOR_DISTANCE_KMS = 4677.0
+VSYS_FOR_DISTANCE_KMS = 4679.0
 
 
 def _compute_kpc_per_arcsec(vsys_kms: float, cosmology=Planck18) -> float:
