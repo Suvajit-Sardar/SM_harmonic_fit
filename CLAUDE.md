@@ -95,13 +95,19 @@ To add a new TRM model, create a new subdirectory of the project root containing
   including `RAD(Kpc)`, `RAD(arcs)`, `VROT(km/s)`, `E_VROT1`, `E_VROT2`, and the
   rest of Section 4's required columns. The **filename is not fixed** — Barolo
   ringlogs are named differently across runs (`stage_1_opt_parameters.txt`,
-  `PA_fixed_to_42.txt` are both seen in this project) — `harmonic_fit.find_ringlog`
+  `B_rings_final.txt` are both seen in this project) — `harmonic_fit.find_ringlog`
   identifies it by its columns, not its name, and deliberately rejects
   `*_initial.txt`-style files (initial guesses only, missing `RAD(Kpc)`/`E_VROT1/2`)
   and any other stray `.txt` sitting alongside it (stats dumps, etc.). If a
   directory has zero or multiple files matching the required columns,
   `find_ringlog` raises rather than guessing — pass `--ringlog` explicitly to
-  `harmonic_fit.py` in that case.
+  `harmonic_fit.py` in that case. **A superseded ringlog from an earlier Barolo
+  stage is not "stray"** in this sense — it still has the required columns, so
+  it *will* trigger the multiple-candidates error if left next to the final
+  one. Move it into its own subdirectory instead of deleting it (`find_ringlog`
+  only globs the top level of the TRM model directory, not recursively) — e.g.
+  `fixed_PA42/pre_regularization/` holds the pre-regularisation-stage ringlog
+  that preceded `B_rings_final.txt`.
 
 That's it — no code changes are required. `harmonic_fit.discover_trm_models(repo_root)`
 finds any subdirectory with a `maps/` folder and a resolvable ringlog; run
@@ -268,9 +274,12 @@ change what the code writes.
 project owner.** Ring *i* spans `RAD - 4.85` → `RAD + 4.85`:
 38.15–47.85, 47.85–57.55, 57.55–67.25, 67.25–76.95. This is the `TRM_paper`
 example; other TRM models (Section 1.1) have their own `RAD` grid in their own
-ringlog — `fixed_PA42`'s, for instance, is `42.0, 51.8, 61.6, 71.4`, spaced by
-9.8″ — but the *convention* below (RAD = ring center, width from `np.diff`) is
-the same for every model, never per-model configuration.
+ringlog — `fixed_PA42`'s (`B_rings_final.txt`, the final both-sides TRM run;
+see Section 1.1 for why an earlier, pre-regularisation ringlog also sits in
+that directory but is excluded from auto-discovery), for instance, is
+`44.0, 53.7, 63.4, 73.1`, spaced by 9.7″ — but the *convention* below (RAD =
+ring center, width from `np.diff`) is the same for every model, never
+per-model configuration.
 
 This convention is not configurable — there is no `rad_convention` toggle and no
 `"inner_edge"` reading, for any TRM model. It reproduces the ring bounds of the
@@ -291,10 +300,12 @@ whatever cosmology/distance Barolo itself assumed internally, which is
 unknown and need not match the project's adopted cosmology. `harmonic_fit.
 KPC_PER_ARCSEC` instead **computes** the scale from Planck18
 (`astropy.cosmology.Planck18`) at the source's redshift
-(`z = VSYS_FOR_DISTANCE_KMS / c`, the low-z/optical convention, anchored to
-`TRM_paper`'s own Barolo VSYS — 4677.0 km/s — so the scale doesn't drift by
-run-to-run VSYS fit noise between TRM models): `kpc_per_arcsec =
-D_A(z) * (1 arcsec in radians)`, which evaluates to ≈ 0.3288 kpc/arcsec —
+(`z = VSYS_FOR_DISTANCE_KMS / c`, the low-z/optical convention: the project's
+adopted systemic velocity, finalised at 4679.0 km/s — not read from any single
+TRM model's ringlog, and not necessarily equal to any one of them, so the
+scale doesn't drift by run-to-run VSYS fit noise between TRM models):
+`kpc_per_arcsec = D_A(z) * (1 arcsec in radians)`, which evaluates to
+≈ 0.3289 kpc/arcsec —
 matching the ≈ 0.329 the old script hardcoded, but now for a documented,
 citable reason rather than as an unexplained literal. `read_ringlog` still
 reads `RAD(Kpc)` and checks Barolo's own implied `RAD(Kpc)/RAD(arcs)` for
